@@ -101,6 +101,7 @@ const els = {
   closeAfterImport: byId<HTMLInputElement>("closeAfterImportSetting"),
   clearPanelAfterImportDefault: byId<HTMLInputElement>("clearPanelAfterImportDefaultSetting"),
   misskeyArtistMode: byId<HTMLSelectElement>("misskeyArtistModeSetting"),
+  sidePanelImageBlurMode: byId<HTMLSelectElement>("sidePanelImageBlurModeSetting"),
   multiAddCaptureLeftClick: byId<HTMLInputElement>("multiAddCaptureLeftClickSetting"),
   multiAddCaptureRightClick: byId<HTMLInputElement>("multiAddCaptureRightClickSetting"),
   saveSettings: byId<HTMLButtonElement>("saveSettingsButton"),
@@ -147,10 +148,14 @@ let mediaMetadata: MediaMetadata | undefined;
 let mediaMetadataRequest = 0;
 let currentQueue: ImportQueueState | undefined;
 let selectedQueueItemId: string | undefined;
+let previewObjectUrl: string | undefined;
 
 const autocompleteCache = new Map<string, TagSuggestion[]>();
 const artistAutocompleteCache = new Map<string, TagSuggestion[]>();
 const categoryCache = new Map<string, string>();
+const queueMetadataRequests = new Set<string>();
+const removedQueueItemIds = new Set<string>();
+const queueClearCutoffs = new Map<number, number>();
 
 void init();
 
@@ -223,6 +228,8 @@ function bindEvents(): void {
     persistSidePanelStateDebounced();
   });
   els.manualList.addEventListener("change", syncManualSelectedTagsToTextbox);
+  els.preview.addEventListener("click", handleBlurredImageClick, { capture: true });
+  els.queueList.addEventListener("click", handleBlurredImageClick, { capture: true });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !els.successPopup.hidden) void dismissSuccessPopup();
   });
@@ -406,8 +413,19 @@ async function clearSidePanelState(options: { showStatus?: boolean } = {}): Prom
   await chrome.storage.session.remove(PENDING_IMPORT_KEY);
   selectedQueueItemId = undefined;
   if (currentQueue) {
-    currentQueue = { ...currentQueue, selectedItemId: undefined, updatedAt: Date.now() };
-    await persistQueueStateNow({ preserveExternalItems: true });
+    const clearedAt = Date.now();
+    for (const item of currentQueue.items) {
+      removedQueueItemIds.add(item.id);
+    }
+    queueClearCutoffs.set(currentQueue.tabId, clearedAt);
+    queueMetadataRequests.clear();
+    currentQueue = {
+      ...currentQueue,
+      selectedItemId: undefined,
+      items: [],
+      updatedAt: clearedAt
+    };
+    await persistQueueStateNow();
   }
 
   draft = {};
@@ -490,9 +508,25 @@ async function handleQueueStoreChanged(store: ImportQueueStore | undefined): Pro
   if (typeof tabId !== "number") return;
 
   const previousHadItems = Boolean(currentQueue?.items.length);
-  currentQueue = normalizeQueueState(tabId, store?.[String(tabId)]);
+  const previousSelectedItemId = selectedQueueItemId;
+  const nextQueue = normalizeQueueState(tabId, store?.[String(tabId)]);
+  const requestedSelectedItemId = nextQueue.selectedItemId;
+  currentQueue = nextQueue;
   const selectedStillExists = selectedQueueItemId ? Boolean(queueItemById(selectedQueueItemId)) : false;
   if (selectedQueueItemId && !selectedStillExists) selectedQueueItemId = undefined;
+
+  if (
+    previousSelectedItemId &&
+    requestedSelectedItemId &&
+    requestedSelectedItemId !== previousSelectedItemId &&
+    queueItemById(previousSelectedItemId) &&
+    queueItemById(requestedSelectedItemId)
+  ) {
+    currentQueue = applyCurrentImportEditsToQueue(currentQueue, previousSelectedItemId);
+    await persistQueueStateNow();
+    await loadQueueItem(requestedSelectedItemId, { skipSave: true, quiet: true, updateStore: false });
+    return;
+  }
 
   if (!selectedQueueItemId && !pendingCreatedAt && !hasActiveImportView() && currentQueue.selectedItemId) {
     await loadQueueItem(currentQueue.selectedItemId, { skipSave: true, quiet: true, updateStore: false });
@@ -505,6 +539,28 @@ async function handleQueueStoreChanged(store: ImportQueueStore | undefined): Pro
   }
 
   renderQueue();
+}
+
+function applyCurrentImportEditsToQueue(queue: ImportQueueState, itemId: string): ImportQueueState {
+  const now = Date.now();
+  return {
+    ...queue,
+    items: queue.items.map((item) =>
+      item.id === itemId
+        ? {
+            ...item,
+            draft,
+            form: currentFormState(),
+            debug: latestDebugSnapshot,
+            mediaMetadata,
+            manual: currentManualQueueState(),
+            uploaded: uploadedState,
+            updatedAt: now
+          }
+        : item
+    ),
+    updatedAt: now
+  };
 }
 
 function hasActiveImportView(): boolean {
@@ -526,33 +582,49 @@ async function readQueueState(tabId: number): Promise<ImportQueueState> {
 }
 
 function normalizeQueueState(tabId: number, state: ImportQueueState | undefined): ImportQueueState {
+  const cutoff = queueClearCutoffs.get(tabId) ?? 0;
+  const items = (Array.isArray(state?.items) ? state.items : []).filter((item) => {
+    if (removedQueueItemIds.has(item.id)) return false;
+    return !cutoff || (item.createdAt ?? 0) > cutoff;
+  });
+  const selectedItemId = items.some((item) => item.id === state?.selectedItemId) ? state?.selectedItemId : undefined;
+
   return {
     tabId,
     captureEnabled: Boolean(state?.captureEnabled),
-    selectedItemId: state?.selectedItemId,
-    items: Array.isArray(state?.items) ? state.items : [],
+    selectedItemId,
+    items,
     updatedAt: state?.updatedAt ?? Date.now()
   };
 }
 
 async function persistQueueStateNow(options: { preserveExternalItems?: boolean } = {}): Promise<void> {
-  if (!currentQueue) return;
+  const queue = currentQueue;
+  if (!queue) return;
   const store = await readQueueStore();
+  let nextQueue = normalizeQueueState(queue.tabId, queue);
+
   if (options.preserveExternalItems) {
-    const latest = normalizeQueueState(currentQueue.tabId, store[String(currentQueue.tabId)]);
-    const currentIds = new Set(currentQueue.items.map((item) => item.id));
+    const latest = normalizeQueueState(nextQueue.tabId, store[String(nextQueue.tabId)]);
+    const currentIds = new Set(nextQueue.items.map((item) => item.id));
     const externalItems = latest.items.filter((item) => !currentIds.has(item.id));
     if (externalItems.length) {
-      currentQueue = {
-        ...currentQueue,
-        items: [...currentQueue.items, ...externalItems],
+      nextQueue = {
+        ...nextQueue,
+        selectedItemId: nextQueue.selectedItemId ?? latest.selectedItemId,
+        items: [...nextQueue.items, ...externalItems],
         updatedAt: Date.now()
       };
     }
   }
+
+  if (currentQueue?.tabId === nextQueue.tabId) {
+    currentQueue = nextQueue;
+  }
+
   await writeQueueStore({
     ...store,
-    [String(currentQueue.tabId)]: currentQueue
+    [String(nextQueue.tabId)]: nextQueue
   });
 }
 
@@ -671,6 +743,7 @@ async function loadQueueItem(
 
   renderAll();
   renderQueue();
+  scrollSelectedQueueItemIntoView();
   renderDebugPanel();
   persistSidePanelStateDebounced();
 }
@@ -681,6 +754,8 @@ function queueStatusTone(status: ImportQueueItem["status"]): StatusTone {
 
 async function removeQueueItem(itemId: string): Promise<void> {
   if (!currentQueue) return;
+  removedQueueItemIds.add(itemId);
+  queueMetadataRequests.delete(itemId);
   const wasSelected = selectedQueueItemId === itemId;
   const remaining = currentQueue.items.filter((item) => item.id !== itemId);
   const nextSelected = wasSelected ? remaining[0]?.id : currentQueue.selectedItemId;
@@ -704,12 +779,18 @@ async function removeQueueItem(itemId: string): Promise<void> {
 
 async function clearQueue(): Promise<void> {
   if (!currentQueue) return;
+  const clearedAt = Date.now();
+  for (const item of currentQueue.items) {
+    removedQueueItemIds.add(item.id);
+  }
+  queueClearCutoffs.set(currentQueue.tabId, clearedAt);
+  queueMetadataRequests.clear();
   selectedQueueItemId = undefined;
   currentQueue = {
     ...currentQueue,
     selectedItemId: undefined,
     items: [],
-    updatedAt: Date.now()
+    updatedAt: clearedAt
   };
   await persistQueueStateNow();
   resetImportView();
@@ -745,7 +826,112 @@ async function toggleMultiAddCapture(): Promise<void> {
     return;
   }
 
-  await setMultiAddCapture(!currentQueue.captureEnabled);
+  const captureEnabled = !currentQueue.captureEnabled;
+  if (captureEnabled) {
+    await queueCurrentStandaloneImportIfNeeded();
+  }
+
+  await setMultiAddCapture(captureEnabled);
+}
+
+async function queueCurrentStandaloneImportIfNeeded(): Promise<void> {
+  if (!currentQueue || !hasStandaloneImportDraft()) return;
+
+  const now = Date.now();
+  const key = queueDraftKey(draft);
+  const existing = key ? currentQueue.items.find((item) => queueDraftKey(item.draft) === key) : undefined;
+  const manual = currentManualQueueState();
+
+  if (existing) {
+    selectedQueueItemId = existing.id;
+    currentQueue = {
+      ...currentQueue,
+      selectedItemId: existing.id,
+      items: currentQueue.items.map((item) =>
+        item.id === existing.id
+          ? {
+              ...item,
+              draft,
+              form: currentFormState(),
+              debug: latestDebugSnapshot ?? item.debug,
+              mediaMetadata: mediaMetadata ?? item.mediaMetadata,
+              manual: manual ?? item.manual,
+              uploaded: uploadedState ?? item.uploaded,
+              updatedAt: now
+            }
+          : item
+      ),
+      updatedAt: now
+    };
+  } else {
+    const itemId = createQueueItemId();
+    selectedQueueItemId = itemId;
+    currentQueue = {
+      ...currentQueue,
+      selectedItemId: itemId,
+      items: [
+        ...currentQueue.items,
+        {
+          id: itemId,
+          createdAt: now,
+          updatedAt: now,
+          draft,
+          form: currentFormState(),
+          debug: latestDebugSnapshot,
+          mediaMetadata,
+          manual,
+          uploaded: uploadedState,
+          status: "queued"
+        }
+      ],
+      updatedAt: now
+    };
+  }
+
+  pendingTabId = currentQueue.tabId;
+  pendingCreatedAt = 0;
+  await chrome.storage.session.remove(PENDING_IMPORT_KEY);
+  await persistQueueStateNow({ preserveExternalItems: true });
+  renderQueue();
+  persistSidePanelStateDebounced();
+}
+
+function hasStandaloneImportDraft(): boolean {
+  return !selectedQueueItemId && Boolean(draft.mediaUrl || draft.previewUrl);
+}
+
+function currentManualQueueState(): ImportQueueItem["manual"] | undefined {
+  if (!manualState) return undefined;
+  return {
+    mediaId: manualState.mediaId,
+    link: manualState.link,
+    predictions: manualState.predictions,
+    baseTags: manualState.baseTags,
+    appliedNames: manualState.appliedNames,
+    selectedNames: selectedManualPredictionNames()
+  };
+}
+
+function createQueueItemId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function queueDraftKey(nextDraft: ImportDraft): string | undefined {
+  return normalizedQueueUrlKey(nextDraft.mediaUrl) ||
+    normalizedQueueUrlKey(nextDraft.previewUrl) ||
+    normalizedQueueUrlKey(nextDraft.sourceUrl) ||
+    normalizedQueueUrlKey(nextDraft.pageUrl);
+}
+
+function normalizedQueueUrlKey(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return value.trim() || undefined;
+  }
 }
 
 async function setMultiAddCapture(captureEnabled: boolean): Promise<void> {
@@ -778,7 +964,7 @@ function renderQueue(): void {
   const queue = currentQueue;
   const items = queue?.items ?? [];
   const captureEnabled = Boolean(queue?.captureEnabled);
-  els.queuePanel.hidden = !captureEnabled && !items.length;
+  els.queuePanel.hidden = !captureEnabled && items.length <= 1;
   els.multiAddToggle.textContent = captureEnabled ? "Disable multi-add" : "Enable multi-add";
   els.multiAddToggle.dataset.active = String(captureEnabled);
   els.queueSummary.textContent = queueSummaryText(items.length, captureEnabled);
@@ -798,6 +984,8 @@ function renderQueue(): void {
   for (const item of items) {
     els.queueList.append(queueRow(item));
   }
+
+  scheduleQueueMetadataHydration(items);
 }
 
 function queueSummaryText(count: number, captureEnabled: boolean): string {
@@ -808,6 +996,7 @@ function queueSummaryText(count: number, captureEnabled: boolean): string {
 function queueRow(item: ImportQueueItem): HTMLElement {
   const row = document.createElement("div");
   row.className = "queue-row";
+  row.dataset.itemId = item.id;
   row.dataset.selected = String(item.id === selectedQueueItemId);
 
   const select = document.createElement("button");
@@ -849,6 +1038,17 @@ function queueRow(item: ImportQueueItem): HTMLElement {
   return row;
 }
 
+function scrollSelectedQueueItemIntoView(): void {
+  const itemId = selectedQueueItemId;
+  if (!itemId || els.queuePanel.hidden) return;
+
+  window.requestAnimationFrame(() => {
+    const row = Array.from(els.queueList.querySelectorAll<HTMLElement>(".queue-row"))
+      .find((element) => element.dataset.itemId === itemId);
+    row?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
+}
+
 function queueThumb(item: ImportQueueItem): HTMLElement {
   const url = item.draft.previewUrl || item.draft.mediaUrl;
   const thumb = document.createElement("span");
@@ -867,6 +1067,7 @@ function queueThumb(item: ImportQueueItem): HTMLElement {
   const image = document.createElement("img");
   image.src = url;
   image.alt = "";
+  markBlurSensitiveImage(image);
   thumb.append(image);
   return thumb;
 }
@@ -886,7 +1087,164 @@ function queueItemMeta(item: ImportQueueItem): string {
   const dimensions = item.mediaMetadata?.width && item.mediaMetadata.height
     ? `${item.mediaMetadata.width} x ${item.mediaMetadata.height}`
     : undefined;
-  return [item.draft.site ?? "generic", dimensions, tags ? `${tags} tags` : undefined, item.statusMessage].filter(Boolean).join(" - ");
+  const size = item.mediaMetadata?.bytes ? formatBytes(item.mediaMetadata.bytes) : undefined;
+  const media = [dimensions, size].filter(Boolean).join(" / ");
+  return [item.draft.site ?? "generic", media || undefined, tags ? `${tags} tags` : undefined, item.statusMessage].filter(Boolean).join(" - ");
+}
+
+function scheduleQueueMetadataHydration(items: ImportQueueItem[]): void {
+  for (const item of items) {
+    if (!shouldHydrateQueueItemMetadata(item) || queueMetadataRequests.has(item.id)) continue;
+    queueMetadataRequests.add(item.id);
+    void hydrateQueueItemMetadata(item.id).finally(() => {
+      queueMetadataRequests.delete(item.id);
+    });
+  }
+}
+
+function shouldHydrateQueueItemMetadata(item: ImportQueueItem): boolean {
+  if (!metadataUrlCandidatesForItem(item).length) return false;
+  if (!item.mediaMetadata) return true;
+  if (item.mediaMetadata.error) return false;
+  return !item.mediaMetadata.width || !item.mediaMetadata.height || (!item.mediaMetadata.bytes && !item.mediaMetadata.sizeProbeFailed);
+}
+
+async function hydrateQueueItemMetadata(itemId: string): Promise<void> {
+  const item = queueItemById(itemId);
+  if (!item || !currentQueue) return;
+
+  let metadata: MediaMetadata | undefined;
+  let lastError: unknown;
+
+  for (const url of metadataUrlCandidatesForItem(item)) {
+    try {
+      metadata = await probeMediaMetadata(url);
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!currentQueue || !queueItemById(itemId)) return;
+  const nextMetadata = metadata ?? {
+    url: metadataUrlCandidatesForItem(item)[0] ?? "",
+    loading: false,
+    error: lastError instanceof Error ? lastError.message : "Could not load media metadata."
+  };
+
+  currentQueue = {
+    ...currentQueue,
+    items: currentQueue.items.map((queueItem) =>
+      queueItem.id === itemId
+        ? {
+            ...queueItem,
+            mediaMetadata: nextMetadata,
+            updatedAt: Date.now()
+          }
+        : queueItem
+    ),
+    updatedAt: Date.now()
+  };
+
+  if (selectedQueueItemId === itemId && mediaMetadata?.url === nextMetadata.url) {
+    mediaMetadata = nextMetadata;
+    renderMediaMetadata();
+  }
+
+  await persistQueueStateNow({ preserveExternalItems: true });
+  renderQueue();
+}
+
+function metadataUrlCandidatesForItem(item: ImportQueueItem): string[] {
+  return fullQualityUrlCandidates([item.draft.mediaUrl, item.draft.previewUrl, ...rawMediaUrls(item.draft.raw)]);
+}
+
+async function probeMediaMetadata(url: string): Promise<MediaMetadata> {
+  const metadata: MediaMetadata = { url, loading: false };
+
+  try {
+    const response = await fetch(url, {
+      method: "HEAD",
+      credentials: "include",
+      referrerPolicy: "no-referrer"
+    });
+    if (!response.ok) throw new Error(`HEAD ${response.status}`);
+    const contentLength = response.headers.get("content-length");
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+    metadata.bytes = contentLength ? Number(contentLength) || undefined : undefined;
+    metadata.mimeType = contentType || undefined;
+    metadata.sizeSource = contentLength ? "head" : undefined;
+  } catch {
+    // Some hosts do not support HEAD. Image/video probing below can still succeed.
+  }
+
+  try {
+    const dimensions = isVideoUrl(url) ? await loadVideoDimensions(url) : await loadImageDimensions(url);
+    metadata.width = dimensions.width;
+    metadata.height = dimensions.height;
+  } catch {
+    // Fall through to blob probing for hosts that block direct extension-page media loads.
+  }
+
+  if (isVideoUrl(url)) return metadata.width || metadata.height || metadata.bytes ? metadata : Promise.reject(new Error("Could not load video metadata."));
+  if (metadata.width && metadata.height && metadata.bytes) return metadata;
+
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      referrerPolicy: "no-referrer"
+    });
+    if (!response.ok) throw new Error(`Metadata fetch failed (${response.status}).`);
+    const blob = await response.blob();
+    metadata.bytes = blob.size || metadata.bytes;
+    metadata.mimeType = blob.type || metadata.mimeType;
+    metadata.sizeSource = "blob";
+
+    if (blob.type.startsWith("image/")) {
+      const objectUrl = URL.createObjectURL(blob);
+      try {
+        const dimensions = await loadImageDimensions(objectUrl);
+        metadata.width = dimensions.width;
+        metadata.height = dimensions.height;
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
+    }
+  } catch (error) {
+    if (metadata.width || metadata.height || metadata.bytes) {
+      metadata.sizeProbeFailed = !metadata.bytes;
+      return metadata;
+    }
+    throw error;
+  }
+
+  if (!metadata.width || !metadata.height) metadata.error = "Could not load dimensions.";
+  return metadata;
+}
+
+function loadImageDimensions(url: string): Promise<{ width?: number; height?: number }> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve({
+      width: image.naturalWidth || undefined,
+      height: image.naturalHeight || undefined
+    });
+    image.onerror = () => reject(new Error("Image metadata failed."));
+    image.src = url;
+  });
+}
+
+function loadVideoDimensions(url: string): Promise<{ width?: number; height?: number }> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => resolve({
+      width: video.videoWidth || undefined,
+      height: video.videoHeight || undefined
+    });
+    video.onerror = () => reject(new Error("Video metadata failed."));
+    video.src = url;
+  });
 }
 
 async function importQueueNoAi(): Promise<void> {
@@ -1184,8 +1542,9 @@ function renderWorkflowState(): void {
 }
 
 function renderPreview(): void {
-  const url = draft.mediaUrl || draft.previewUrl;
+  const url = previewUrlCandidates()[0];
   const requestId = ++mediaMetadataRequest;
+  revokePreviewObjectUrl();
   els.preview.replaceChildren();
 
   if (!url) {
@@ -1207,6 +1566,10 @@ function renderPreview(): void {
   }
   void fetchHeadMediaMetadata(url, requestId);
 
+  renderPreviewUrl(url, requestId);
+}
+
+function renderPreviewUrl(url: string, requestId: number): void {
   if (isVideoUrl(url)) {
     const video = document.createElement("video");
     video.src = url;
@@ -1225,14 +1588,116 @@ function renderPreview(): void {
 
   const image = document.createElement("img");
   image.src = url;
-  image.alt = "Import preview";
+  image.alt = "";
+  markBlurSensitiveImage(image);
   image.addEventListener("load", () => {
     updateMediaMetadata(url, requestId, {
       width: image.naturalWidth || undefined,
       height: image.naturalHeight || undefined
     });
   });
+  image.addEventListener("error", () => {
+    if (requestId !== mediaMetadataRequest) return;
+    void renderImageBlobPreview(url, requestId);
+  }, { once: true });
   els.preview.append(image);
+}
+
+async function renderImageBlobPreview(url: string, requestId: number): Promise<void> {
+  const loading = document.createElement("div");
+  loading.className = "preview-empty";
+  loading.textContent = "Loading preview...";
+  els.preview.replaceChildren(loading);
+
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      referrerPolicy: "no-referrer"
+    });
+
+    if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+    if (!response.ok) throw new Error(`Preview fetch failed (${response.status}).`);
+
+    const blob = await response.blob();
+    if (!blob.type.startsWith("image/")) throw new Error(blob.type ? `Preview is ${blob.type}.` : "Preview is not an image.");
+
+    revokePreviewObjectUrl();
+    previewObjectUrl = URL.createObjectURL(blob);
+    updateMediaMetadata(url, requestId, {
+      bytes: blob.size || mediaMetadata?.bytes,
+      mimeType: blob.type || mediaMetadata?.mimeType,
+      sizeSource: "blob",
+      loading: false
+    });
+
+    const image = document.createElement("img");
+    image.src = previewObjectUrl;
+    image.alt = "";
+    markBlurSensitiveImage(image);
+    image.addEventListener("load", () => {
+      updateMediaMetadata(url, requestId, {
+        width: image.naturalWidth || undefined,
+        height: image.naturalHeight || undefined,
+        loading: false
+      });
+    });
+    image.addEventListener("error", () => {
+      if (requestId !== mediaMetadataRequest) return;
+      showPreviewLoadFailure(url, requestId, "Preview blob could not be displayed.");
+    }, { once: true });
+    els.preview.replaceChildren(image);
+  } catch (error) {
+    if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+    if (tryFallbackPreviewUrl(url, requestId)) return;
+    showPreviewLoadFailure(url, requestId, error instanceof Error ? error.message : "Preview failed to load.");
+  }
+}
+
+function previewUrlCandidates(): string[] {
+  return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
+}
+
+function tryFallbackPreviewUrl(failedUrl: string, requestId: number): boolean {
+  const fallback = previewUrlCandidates().find((candidate) => candidate !== failedUrl);
+  if (!fallback) return false;
+  revokePreviewObjectUrl();
+  els.preview.replaceChildren();
+  resetMediaMetadata(fallback);
+  void fetchHeadMediaMetadata(fallback, requestId);
+  renderPreviewUrl(fallback, requestId);
+  return true;
+}
+
+function showPreviewLoadFailure(url: string, requestId: number, message: string): void {
+  updateMediaMetadata(url, requestId, {
+    loading: false,
+    error: message
+  });
+  const empty = document.createElement("div");
+  empty.className = "preview-empty";
+  empty.textContent = "Preview failed to load";
+  els.preview.replaceChildren(empty);
+}
+
+function markBlurSensitiveImage(image: HTMLImageElement): void {
+  image.classList.add("blur-sensitive-media");
+}
+
+function handleBlurredImageClick(event: MouseEvent): void {
+  if (settings.sidePanelImageBlurMode !== "click") return;
+  const target = event.target instanceof Element ? event.target : undefined;
+  const image = target?.closest<HTMLImageElement>("img.blur-sensitive-media");
+  if (!image || image.dataset.blurRevealed === "true") return;
+
+  image.dataset.blurRevealed = "true";
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function revokePreviewObjectUrl(): void {
+  if (!previewObjectUrl) return;
+  URL.revokeObjectURL(previewObjectUrl);
+  previewObjectUrl = undefined;
 }
 
 function resetMediaMetadata(url: string): void {
@@ -1242,31 +1707,15 @@ function resetMediaMetadata(url: string): void {
 
 async function fetchHeadMediaMetadata(url: string, requestId: number): Promise<void> {
   try {
-    const response = await fetch(url, {
-      method: "HEAD",
-      credentials: "include",
-      referrerPolicy: "no-referrer"
-    });
-
-    if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
-
-    if (!response.ok) {
-      updateMediaMetadata(url, requestId, { loading: false, error: `HEAD ${response.status}` });
-      return;
-    }
-
-    const contentLength = response.headers.get("content-length");
-    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+    const metadata = await probeMediaMetadata(url);
     updateMediaMetadata(url, requestId, {
-      bytes: contentLength ? Number(contentLength) || undefined : undefined,
-      mimeType: contentType || undefined,
-      sizeSource: contentLength ? "head" : undefined,
+      ...metadata,
       loading: false
     });
   } catch (error) {
     updateMediaMetadata(url, requestId, {
       loading: false,
-      error: error instanceof Error ? error.message : "HEAD failed"
+      error: error instanceof Error ? error.message : "Metadata failed"
     });
   }
 }
@@ -1296,7 +1745,12 @@ function renderMediaMetadata(): void {
   ].filter((part): part is string => Boolean(part));
 
   if (parts.length) {
-    els.mediaMetadata.textContent = parts.join(" • ");
+    els.mediaMetadata.textContent = mediaMetadata.error ? `${parts.join(" • ")} • ${mediaMetadata.error}` : parts.join(" • ");
+    return;
+  }
+
+  if (mediaMetadata.error) {
+    els.mediaMetadata.textContent = mediaMetadata.error;
     return;
   }
 
@@ -1345,6 +1799,7 @@ async function persistSettings(): Promise<void> {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    sidePanelImageBlurMode: els.sidePanelImageBlurMode.value as AppSettings["sidePanelImageBlurMode"],
     multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
     multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
@@ -1369,9 +1824,11 @@ function renderSettings(nextSettings: AppSettings): void {
   els.closeAfterImport.checked = nextSettings.closeAfterImport;
   els.clearPanelAfterImportDefault.checked = nextSettings.clearPanelAfterImportDefault;
   els.misskeyArtistMode.value = nextSettings.misskeyArtistMode;
+  els.sidePanelImageBlurMode.value = nextSettings.sidePanelImageBlurMode;
   els.multiAddCaptureLeftClick.checked = nextSettings.multiAddCaptureLeftClick;
   els.multiAddCaptureRightClick.checked = nextSettings.multiAddCaptureRightClick;
   els.debugMode.checked = nextSettings.debugMode;
+  document.documentElement.dataset.sidePanelImageBlurMode = nextSettings.sidePanelImageBlurMode;
 }
 
 async function importNoAi(): Promise<void> {
@@ -1474,21 +1931,42 @@ async function uploadCurrentMedia(
   api: BlombooruApi,
   payload: ReturnType<typeof buildFinalPayload>
 ): Promise<UploadMediaResult> {
-  const mediaUrl = draft.mediaUrl;
-  if (!mediaUrl) throw new Error(missingMediaUrlMessage());
+  const mediaUrls = mediaFetchCandidates();
+  if (!mediaUrls.length) throw new Error(missingMediaUrlMessage());
 
   setStatus("Fetching and hashing media...", "info");
-  const stable = await fetchMediaAsStableFile(mediaUrl);
-  updateMediaMetadataAfterBlob(mediaUrl, stable.file.size, stable.mimeType);
+  const fetched = await fetchCurrentMediaAsStableFile(mediaUrls);
+  updateMediaMetadataAfterBlob(fetched.url, fetched.stable.file.size, fetched.stable.mimeType);
 
   setStatus("Uploading to Blombooru...", "info");
   return api.uploadMedia({
-    file: stable.file,
+    file: fetched.stable.file,
     rating: payload.rating,
     source: payload.source,
     tags: payload.tags,
     categoryHints: payload.categoryHints
   });
+}
+
+async function fetchCurrentMediaAsStableFile(mediaUrls: string[]): Promise<{ url: string; stable: Awaited<ReturnType<typeof fetchMediaAsStableFile>> }> {
+  let lastError: unknown;
+
+  for (const url of mediaUrls) {
+    try {
+      return {
+        url,
+        stable: await fetchMediaAsStableFile(url)
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Media fetch failed.");
+}
+
+function mediaFetchCandidates(): string[] {
+  return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
 }
 
 function markUploaded(upload: UploadMediaResult, options: { mediaId?: string; finalSaved?: boolean } = {}): void {
@@ -1688,6 +2166,7 @@ function requireConfiguredApi(): BlombooruApi {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    sidePanelImageBlurMode: els.sidePanelImageBlurMode.value as AppSettings["sidePanelImageBlurMode"],
     multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
     multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
@@ -1955,6 +2434,7 @@ function buildDebugReport(): Record<string, unknown> {
       closeAfterImport: settings.closeAfterImport,
       clearPanelAfterImportDefault: settings.clearPanelAfterImportDefault,
       misskeyArtistMode: settings.misskeyArtistMode,
+      sidePanelImageBlurMode: settings.sidePanelImageBlurMode,
       debugMode: settings.debugMode,
       apiKeyConfigured: Boolean(settings.apiKey)
     },
@@ -2313,6 +2793,117 @@ function hideAutocomplete(): void {
 
 function isVideoUrl(url: string): boolean {
   return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(url);
+}
+
+function uniqueUrls(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    if (!value) continue;
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+
+  return result;
+}
+
+function preferOriginalUrls(urls: string[]): string[] {
+  const originals = urls.filter((url) => !isProbableThumbnailUrl(url));
+  const thumbnails = urls.filter((url) => isProbableThumbnailUrl(url));
+  return originals.length ? [...originals, ...thumbnails] : urls;
+}
+
+function fullQualityUrlCandidates(values: Array<string | undefined>): string[] {
+  const promotedUrls = values.flatMap((value) => {
+    const fullUrl = fullQualityProxyUrl(value);
+    return fullUrl ? [fullUrl] : [];
+  });
+  const originalUrls = values.filter((value): value is string => Boolean(value));
+
+  return preferOriginalUrls(uniqueUrls([...promotedUrls, ...originalUrls]));
+}
+
+function fullQualityProxyUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    if (!url.searchParams.has("url")) return undefined;
+
+    const before = url.href;
+    url.searchParams.delete("thumbnail");
+    url.searchParams.delete("fallback");
+    url.searchParams.delete("preview");
+    const size = url.searchParams.get("size");
+    if (size && /^(?:thumb|thumbnail|preview|small)$/i.test(size)) url.searchParams.delete("size");
+
+    url.pathname = url.pathname
+      .replace(/\/thumbnail(?:\.[^/?#]+)?$/i, "/image.webp")
+      .replace(/\/preview(?:\.[^/?#]+)?$/i, "/image.webp")
+      .replace(/\/static(?:\.[^/?#]+)?$/i, "/image.webp");
+    url.searchParams.delete("static");
+
+    return url.href !== before || isProbableThumbnailUrl(value) ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rawMediaUrls(raw: unknown): string[] {
+  const urls: string[] = [];
+  const seenObjects = new Set<object>();
+
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object" || seenObjects.has(value)) return;
+    seenObjects.add(value);
+
+    const record = value as Record<string, unknown>;
+    for (const key of ["linkUrl", "srcUrl", "mediaUrl", "previewUrl"]) {
+      const url = typeof record[key] === "string" ? record[key] : undefined;
+      if (url && isLikelyMediaCandidateUrl(url)) urls.push(url);
+    }
+
+    for (const child of Object.values(record)) {
+      visit(child);
+    }
+  };
+
+  visit(raw);
+  return uniqueUrls(urls);
+}
+
+function isLikelyMediaCandidateUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /\.(jpe?g|png|webp|gif|avif|mp4|webm|mov|m4v)(\?|#|$)/i.test(url.pathname) ||
+      url.pathname.includes("/files/") ||
+      (url.pathname.includes("/proxy/") && url.searchParams.has("url"));
+  } catch {
+    return false;
+  }
+}
+
+function isProbableThumbnailUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.toLowerCase();
+    return (
+      /\/thumbnail(?:[-/]|$)/i.test(path) ||
+      path.includes("thumbnail.webp") ||
+      path.includes("preview.webp") ||
+      path.includes("static.webp") ||
+      url.searchParams.get("thumbnail") === "1" ||
+      url.searchParams.get("preview") === "1" ||
+      url.searchParams.get("static") === "1" ||
+      url.searchParams.get("fallback") === "1" ||
+      /^(?:thumb|thumbnail|preview|small)$/i.test(url.searchParams.get("size") ?? "")
+    );
+  } catch {
+    return /thumbnail|preview|static/i.test(value);
+  }
 }
 
 function formatPercent(value: number | undefined): string {

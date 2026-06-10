@@ -345,6 +345,26 @@ textarea:focus {
   object-fit: contain;
 }
 
+.blur-sensitive-media {
+  transition: filter 500ms ease, transform 500ms ease;
+}
+
+html[data-side-panel-image-blur-mode="hover"] .blur-sensitive-media,
+html[data-side-panel-image-blur-mode="click"] .blur-sensitive-media:not([data-blur-revealed="true"]) {
+  filter: blur(18px);
+  transform: scale(1.02);
+}
+
+html[data-side-panel-image-blur-mode="hover"] .preview:hover .blur-sensitive-media,
+html[data-side-panel-image-blur-mode="hover"] .queue-thumb:hover .blur-sensitive-media {
+  filter: blur(0);
+  transform: scale(1);
+}
+
+html[data-side-panel-image-blur-mode="click"] .blur-sensitive-media:not([data-blur-revealed="true"]) {
+  cursor: pointer;
+}
+
 .preview-empty {
   color: var(--muted);
   font-size: 13px;

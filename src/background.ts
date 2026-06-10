@@ -150,15 +150,24 @@ async function handleContextMenuClick(
     createdAt: Date.now()
   };
 
-  const pendingWrite = chrome.storage.session.set({ [PENDING_IMPORT_KEY]: pending });
-
   if (typeof tabId !== "number") {
-    await pendingWrite;
+    await chrome.storage.session.set({ [PENDING_IMPORT_KEY]: pending });
     return;
   }
 
+  const sidePanelOpen = openSidePanelForTab(tabId).catch(() => undefined);
+  const queue = await readQueueState(tabId);
+  if (queue.captureEnabled) {
+    const enriched = await enrichDraftFromTabWithDebug(tabId, baseDraft);
+    await appendQueueDraft(tabId, enriched.draft, enriched.debug);
+    await sidePanelOpen;
+    return;
+  }
+
+  const pendingWrite = chrome.storage.session.set({ [PENDING_IMPORT_KEY]: pending });
+
   try {
-    await openSidePanelForTab(tabId);
+    await sidePanelOpen;
   } finally {
     await pendingWrite;
   }
@@ -179,19 +188,29 @@ async function openSidePanelForTab(tabId: number | undefined): Promise<void> {
 }
 
 async function enrichDraftFromTab(tabId: number, draft: ImportDraft): Promise<ImportDraft> {
+  return (await enrichDraftFromTabWithDebug(tabId, draft)).draft;
+}
+
+async function enrichDraftFromTabWithDebug(
+  tabId: number,
+  draft: ImportDraft
+): Promise<{ draft: ImportDraft; debug?: ImportDebugSnapshot }> {
   try {
     const response = await chrome.tabs.sendMessage(tabId, {
       type: EXTRACT_PAGE_CONTEXT_MESSAGE,
       draft
     });
     if (response?.ok && response.draft) {
-      return mergeDrafts(draft, response.draft as ImportDraft);
+      return {
+        draft: mergeDrafts(draft, response.draft as ImportDraft),
+        debug: response.debug as ImportDebugSnapshot | undefined
+      };
     }
   } catch {
     // Content scripts are not available on every page. The generic context-menu draft is enough as a fallback.
   }
 
-  return draft;
+  return { draft };
 }
 
 async function enrichPendingImportFromTab(tabId: number, pending: PendingImport): Promise<void> {
@@ -246,7 +265,7 @@ async function appendQueueDraft(
       duplicate = true;
       return {
         ...state,
-        selectedItemId: state.selectedItemId ?? existing.id,
+        selectedItemId: existing.id,
         items: state.items.map((item) =>
           item.id === existing.id
             ? {
@@ -272,7 +291,7 @@ async function appendQueueDraft(
 
     return {
       ...state,
-      selectedItemId: state.selectedItemId ?? itemId,
+      selectedItemId: itemId,
       items: [...state.items, item],
       updatedAt: now
     };

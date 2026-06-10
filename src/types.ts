@@ -4,6 +4,8 @@ export type SiteKind = "misskey" | "x" | "booru" | "generic";
 
 export type MisskeyArtistMode = "append-domain" | "username-only" | "domain-tag";
 
+export type SidePanelImageBlurMode = "off" | "hover" | "click";
+
 export type TagCategory =
   | "general"
   | "artist"
@@ -40,6 +42,7 @@ export type AppSettings = {
   closeAfterImport: boolean;
   clearPanelAfterImportDefault: boolean;
   misskeyArtistMode: MisskeyArtistMode;
+  sidePanelImageBlurMode: SidePanelImageBlurMode;
   multiAddCaptureLeftClick: boolean;
   multiAddCaptureRightClick: boolean;
   debugMode: boolean;
@@ -93,6 +96,7 @@ export type ImportMediaMetadata = {
   bytes?: number;
   mimeType?: string;
   sizeSource?: "head" | "blob";
+  sizeProbeFailed?: boolean;
   loading?: boolean;
   error?: string;
 };

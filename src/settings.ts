@@ -14,6 +14,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   closeAfterImport: false,
   clearPanelAfterImportDefault: false,
   misskeyArtistMode: "username-only",
+  sidePanelImageBlurMode: "off",
   multiAddCaptureLeftClick: false,
   multiAddCaptureRightClick: true,
   debugMode: false
@@ -45,6 +46,7 @@ export function normalizeSettings(value: Partial<AppSettings> | undefined): AppS
     closeAfterImport: Boolean(legacyValue?.closeAfterImport ?? legacyValue?.closeAfterAiAuto ?? DEFAULT_SETTINGS.closeAfterImport),
     clearPanelAfterImportDefault: Boolean(settings.clearPanelAfterImportDefault),
     misskeyArtistMode: isMisskeyArtistMode(settings.misskeyArtistMode) ? settings.misskeyArtistMode : DEFAULT_SETTINGS.misskeyArtistMode,
+    sidePanelImageBlurMode: isSidePanelImageBlurMode(settings.sidePanelImageBlurMode) ? settings.sidePanelImageBlurMode : DEFAULT_SETTINGS.sidePanelImageBlurMode,
     multiAddCaptureLeftClick: settingBoolean(settings.multiAddCaptureLeftClick, DEFAULT_SETTINGS.multiAddCaptureLeftClick),
     multiAddCaptureRightClick: settingBoolean(settings.multiAddCaptureRightClick, DEFAULT_SETTINGS.multiAddCaptureRightClick),
     debugMode: Boolean(settings.debugMode)
@@ -57,6 +59,10 @@ function isRating(value: unknown): value is AppSettings["defaultRating"] {
 
 function isMisskeyArtistMode(value: unknown): value is AppSettings["misskeyArtistMode"] {
   return value === "append-domain" || value === "username-only" || value === "domain-tag";
+}
+
+function isSidePanelImageBlurMode(value: unknown): value is AppSettings["sidePanelImageBlurMode"] {
+  return value === "off" || value === "hover" || value === "click";
 }
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {

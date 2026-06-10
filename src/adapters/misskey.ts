@@ -13,6 +13,7 @@ import type { SiteAdapter } from ".";
 type MisskeyMediaCandidate = {
   originalUrl: string;
   canonicalUrl: string;
+  importUrl: string;
   previewUrl?: string;
   source: string;
   score: number;
@@ -242,6 +243,15 @@ function selectMisskeyMedia(
   remembered: ImportDraft | undefined
 ): { mediaUrl?: string; previewUrl?: string } {
   const candidates = new Map<string, MisskeyMediaCandidate>();
+  const activePreview = activeMisskeyPhotoSwipeImage();
+  const photoSwipeTarget = isMisskeyPhotoSwipeTarget(target);
+  const focusedMediaUrls = uniqueUrls([
+    directElementUrl(target),
+    draft.mediaUrl,
+    draft.previewUrl,
+    directElementUrl(activePreview)
+  ]);
+  const limitContainerToFocusedMedia = Boolean(focusedMediaUrls.length && (photoSwipeTarget || isMediaTarget(target) || draft.mediaUrl || draft.previewUrl));
 
   const addCandidate = (url: string | undefined, source: string, score: number, element?: Element, previewUrl?: string) => {
     const originalUrl = absoluteUrl(url);
@@ -252,6 +262,7 @@ function selectMisskeyMedia(
     const candidate: MisskeyMediaCandidate = {
       originalUrl,
       canonicalUrl,
+      importUrl: misskeyImportUrl(originalUrl, canonicalUrl),
       previewUrl: absoluteUrl(previewUrl) || originalUrl,
       source,
       score: score + mediaQualityScore(canonicalUrl, originalUrl, element),
@@ -264,28 +275,31 @@ function selectMisskeyMedia(
     }
   };
 
-  const photoSwipeTarget = isMisskeyPhotoSwipeTarget(target);
+  addCandidate(draft.sourceUrl, "context-menu source media url", photoSwipeTarget ? 7900 : 6700, target, draft.previewUrl);
+  for (const url of rawMisskeyMediaUrls(draft.raw)) {
+    addCandidate(url, "context-menu raw media url", photoSwipeTarget ? 8200 : 7100, target, draft.previewUrl);
+  }
   addCandidate(draft.mediaUrl, "context-menu media url", photoSwipeTarget ? 6200 : 5000, target, draft.previewUrl);
   addCandidate(draft.previewUrl, "context-menu preview url", photoSwipeTarget ? 6100 : 4300, target, draft.previewUrl);
-  addCandidate(directElementUrl(target), "right-click target", photoSwipeTarget ? 7000 : 4900, target);
-  addCandidate(target?.closest<HTMLAnchorElement>("a[href]")?.href, "right-click media link", photoSwipeTarget ? 6900 : 4850, target);
-
-  const activePreview = activeMisskeyPhotoSwipeImage();
-  addCandidate(directElementUrl(activePreview), "PhotoSwipe active image", photoSwipeTarget ? 6800 : 4800, activePreview);
+  addElementCandidates(target, "right-click target", photoSwipeTarget ? 7000 : 4900);
+  addCandidate(target?.closest<HTMLAnchorElement>("a[href]")?.href, "right-click media link", photoSwipeTarget ? 7800 : 6600, target);
+  addElementCandidates(activePreview, "PhotoSwipe active image", photoSwipeTarget ? 6800 : 4800);
 
   addCandidate(remembered?.mediaUrl, "remembered Misskey note media", 4700, undefined, remembered?.previewUrl);
   addCandidate(remembered?.previewUrl, "remembered Misskey note preview", 4200, undefined, remembered?.previewUrl);
 
   container?.querySelectorAll<HTMLElement>(
-    ".image a[href], [data-id] a[href], a[href*='/files/'], img[src], video[src], video source[src]"
+    ".image a[href], [data-id] a[href], a[href*='/files/'], a[href*='/proxy/'], a[href*='url='], img[src], video[src], video source[src]"
   ).forEach((element) => {
+    if (limitContainerToFocusedMedia && !elementMatchesFocusedMedia(element, focusedMediaUrls, target)) return;
+
     if (element instanceof HTMLAnchorElement) {
-      addCandidate(element.href, "Misskey note media link", 4550, element);
+      addCandidate(element.href, "Misskey note media link", 5400, element);
       const nestedImage = element.querySelector<HTMLImageElement>("img[src]");
-      addCandidate(directElementUrl(nestedImage ?? undefined), "Misskey linked preview image", 4400, nestedImage ?? element, element.href);
+      addElementCandidates(nestedImage ?? undefined, "Misskey linked preview image", 3600, element.href);
       return;
     }
-    addCandidate(directElementUrl(element), "Misskey note media element", 4300, element);
+    addElementCandidates(element, "Misskey note media element", 4300);
   });
 
   const selected = Array.from(candidates.values())
@@ -293,9 +307,88 @@ function selectMisskeyMedia(
     .sort((a, b) => candidateRank(b) - candidateRank(a))[0];
 
   return {
-    mediaUrl: selected?.canonicalUrl || remembered?.mediaUrl || absoluteUrl(draft.mediaUrl),
+    mediaUrl: selected?.importUrl || remembered?.mediaUrl || absoluteUrl(draft.mediaUrl),
     previewUrl: selected?.previewUrl || remembered?.previewUrl || absoluteUrl(draft.previewUrl) || selected?.canonicalUrl
   };
+
+  function addElementCandidates(element: Element | undefined, source: string, score: number, previewUrl?: string): void {
+    if (!element) return;
+    const urls = elementUrls(element);
+    if (!urls.length) {
+      addCandidate(directElementUrl(element), source, score, element, previewUrl);
+      return;
+    }
+
+    for (const url of urls) {
+      addCandidate(url, source, score, element, previewUrl);
+    }
+
+    if (element instanceof HTMLImageElement) {
+      addCandidate(element.getAttribute("data-original") ?? undefined, `${source} data-original`, score + 700, element, previewUrl);
+      addCandidate(element.getAttribute("data-url") ?? undefined, `${source} data-url`, score + 700, element, previewUrl);
+      addCandidate(bestSrcsetUrl(element.getAttribute("srcset")), `${source} srcset`, score + 350, element, previewUrl);
+    }
+  }
+}
+
+function isMediaTarget(element: Element | undefined): boolean {
+  if (!element) return false;
+  if (element instanceof HTMLImageElement || element instanceof HTMLVideoElement || element instanceof HTMLSourceElement) return true;
+  return Boolean(element.closest("img, video, source"));
+}
+
+function rawMisskeyMediaUrls(raw: unknown): string[] {
+  const urls: string[] = [];
+  const seenObjects = new Set<object>();
+
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object" || seenObjects.has(value)) return;
+    seenObjects.add(value);
+
+    const record = value as Record<string, unknown>;
+    for (const key of ["linkUrl", "srcUrl", "mediaUrl", "previewUrl"]) {
+      const url = typeof record[key] === "string" ? record[key] : undefined;
+      if (url && isAcceptedRawMisskeyMediaUrl(url)) urls.push(url);
+    }
+
+    for (const child of Object.values(record)) {
+      visit(child);
+    }
+  };
+
+  visit(raw);
+  return uniqueUrls(urls);
+}
+
+function isAcceptedRawMisskeyMediaUrl(value: string): boolean {
+  const canonical = canonicalizeMisskeyMediaUrl(value);
+  return Boolean(canonical && isAcceptedMisskeyMediaUrl(canonical, value, undefined));
+}
+
+function elementMatchesFocusedMedia(element: Element, mediaUrls: string[], target: Element | undefined): boolean {
+  if (target && (element === target || element.contains(target))) return true;
+  return mediaUrls.some((mediaUrl) => elementMediaUrls(element).some((candidate) => sameMisskeyMediaUrl(candidate, mediaUrl)));
+}
+
+function elementMediaUrls(element: Element): string[] {
+  const urls: string[] = [];
+  const add = (value: string | undefined | null) => {
+    const url = absoluteUrl(value);
+    if (url) urls.push(url);
+  };
+  const collect = (candidate: Element) => {
+    for (const url of elementUrls(candidate)) add(url);
+    if (candidate instanceof HTMLAnchorElement) add(candidate.href);
+    if (candidate instanceof HTMLImageElement) {
+      add(candidate.getAttribute("data-original"));
+      add(candidate.getAttribute("data-url"));
+      add(bestSrcsetUrl(candidate.getAttribute("srcset")));
+    }
+  };
+
+  collect(element);
+  element.querySelectorAll("img, video, source, a[href]").forEach(collect);
+  return uniqueUrls(urls);
 }
 
 function directElementUrl(element: Element | undefined): string | undefined {
@@ -350,10 +443,73 @@ function canonicalizeMisskeyMediaUrl(value: string): string | undefined {
   }
 }
 
+function misskeyImportUrl(originalUrl: string, canonicalUrl: string): string {
+  if (originalUrl === canonicalUrl) return canonicalUrl;
+
+  try {
+    const fullProxy = misskeyFullProxyUrl(originalUrl);
+    if (fullProxy) return fullProxy;
+
+    const original = new URL(originalUrl);
+    if (original.origin === location.origin && !isMisskeyThumbnailUrl(originalUrl)) return originalUrl;
+  } catch {
+    // Fall back to the canonical URL.
+  }
+
+  return canonicalUrl;
+}
+
+function misskeyFullProxyUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value, location.href);
+    if (url.origin !== location.origin || !url.searchParams.has("url")) return undefined;
+
+    const before = url.href;
+    url.searchParams.delete("thumbnail");
+    url.searchParams.delete("fallback");
+    url.searchParams.delete("preview");
+    const size = url.searchParams.get("size");
+    if (size && /^(?:thumb|thumbnail|preview|small)$/i.test(size)) url.searchParams.delete("size");
+
+    url.pathname = url.pathname
+      .replace(/\/thumbnail(?:\.[^/?#]+)?$/i, "/image.webp")
+      .replace(/\/preview(?:\.[^/?#]+)?$/i, "/image.webp")
+      .replace(/\/static(?:\.[^/?#]+)?$/i, "/image.webp");
+    url.searchParams.delete("static");
+
+    return url.href !== before || isMisskeyThumbnailUrl(value) ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function isAcceptedMisskeyMediaUrl(canonicalUrl: string, originalUrl: string, element: Element | undefined): boolean {
   if (isDecorativeMisskeyUrl(originalUrl) || isDecorativeMisskeyUrl(canonicalUrl)) return false;
   if (isDecorativeMisskeyElement(element)) return false;
   return isLikelyImportableMediaUrl(canonicalUrl) || /\/files\//.test(new URL(canonicalUrl, location.href).pathname);
+}
+
+function bestSrcsetUrl(srcset: string | null): string | undefined {
+  if (!srcset) return undefined;
+  return srcset
+    .split(",")
+    .map((entry) => entry.trim().split(/\s+/)[0])
+    .filter(Boolean)
+    .pop();
+}
+
+function uniqueUrls(values: Array<string | undefined | null>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    const url = absoluteUrl(value);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    result.push(url);
+  }
+
+  return result;
 }
 
 function sameMisskeyMediaUrl(left: string | undefined, right: string | undefined): boolean {
@@ -365,10 +521,23 @@ function sameMisskeyMediaUrl(left: string | undefined, right: string | undefined
   try {
     const leftUrl = new URL(leftCanonical, location.href);
     const rightUrl = new URL(rightCanonical, location.href);
-    return leftUrl.hostname === rightUrl.hostname && leftUrl.pathname === rightUrl.pathname;
+    if (leftUrl.hostname === rightUrl.hostname && leftUrl.pathname === rightUrl.pathname) return true;
+
+    const leftIdentity = misskeyMediaIdentity(leftUrl);
+    const rightIdentity = misskeyMediaIdentity(rightUrl);
+    return Boolean(leftIdentity && rightIdentity && leftIdentity === rightIdentity);
   } catch {
     return false;
   }
+}
+
+function misskeyMediaIdentity(url: URL): string | undefined {
+  const file = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() ?? "");
+  const key = file
+    .replace(/^(?:original|webpublic|thumbnail|preview)-/i, "")
+    .replace(/\.(?:jpe?g|png|webp|gif|avif)$/i, "");
+
+  return key.length >= 10 ? `${url.hostname}/${key}` : undefined;
 }
 
 function isLikelyImportableMediaUrl(value: string): boolean {
@@ -410,9 +579,10 @@ function mediaQualityScore(canonicalUrl: string, originalUrl: string, element: E
     const canonical = new URL(canonicalUrl);
     const original = new URL(originalUrl);
     if (canonical.href !== original.href) score += 600;
+    if (original.origin === location.origin && !isMisskeyThumbnailUrl(originalUrl)) score += 1400;
     if (/\/original\//i.test(canonical.pathname)) score += 900;
-    if (/\/thumbnail[-/]/i.test(canonical.pathname) || /\/thumbnail[-/]/i.test(original.pathname)) score -= 2200;
-    if (canonical.pathname.includes("/files/webpublic-")) score += 120;
+    if (canonical.pathname.includes("/files/webpublic-")) score += 1600;
+    if (isMisskeyThumbnailUrl(canonicalUrl) || isMisskeyThumbnailUrl(originalUrl)) score -= 5200;
   } catch {
     // Keep the base score.
   }
@@ -424,6 +594,26 @@ function mediaQualityScore(canonicalUrl: string, originalUrl: string, element: E
   }
 
   return score;
+}
+
+function isMisskeyThumbnailUrl(value: string): boolean {
+  try {
+    const url = new URL(value, location.href);
+    const path = url.pathname.toLowerCase();
+    return (
+      /\/thumbnail(?:[-/]|$)/i.test(path) ||
+      path.includes("thumbnail.webp") ||
+      path.includes("preview.webp") ||
+      path.includes("static.webp") ||
+      url.searchParams.get("thumbnail") === "1" ||
+      url.searchParams.get("preview") === "1" ||
+      url.searchParams.get("static") === "1" ||
+      url.searchParams.get("fallback") === "1" ||
+      /^(?:thumb|thumbnail|preview|small)$/i.test(url.searchParams.get("size") ?? "")
+    );
+  } catch {
+    return /thumbnail|preview|static/i.test(value);
+  }
 }
 
 function candidateRank(candidate: MisskeyMediaCandidate): number {
