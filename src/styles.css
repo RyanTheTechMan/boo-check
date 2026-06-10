@@ -201,7 +201,7 @@ textarea:focus {
 
 @media (min-width: 560px) {
   .queue-actions {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
@@ -209,6 +209,11 @@ textarea:focus {
   min-height: 32px;
   padding: 0 9px;
   font-size: 12px;
+}
+
+.queue-actions button[data-active="true"] {
+  border-color: rgba(132, 209, 143, 0.65);
+  color: var(--success);
 }
 
 .queue-list {

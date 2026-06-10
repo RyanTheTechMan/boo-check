@@ -122,6 +122,7 @@ export type ImportQueueItem = {
 export type ImportQueueState = {
   tabId: number;
   captureEnabled: boolean;
+  autoCollectEnabled: boolean;
   selectedItemId?: string;
   items: ImportQueueItem[];
   updatedAt: number;

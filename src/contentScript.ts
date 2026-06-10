@@ -79,6 +79,10 @@ const TWEET_RESULT_FIELD_TOGGLES_FALLBACK = [
   "withAuxiliaryUserLabels"
 ];
 
+const AUTO_COLLECT_SCAN_DELAY_MS = 250;
+const AUTO_COLLECT_ROOT_MARGIN = "700px 0px";
+const MAX_AUTO_COLLECT_TARGETS_PER_POST = 12;
+
 type TwitterApiMetadata = {
   bearerToken: string;
   queryId: string;
@@ -108,8 +112,15 @@ let twitterApiMetadataPromise: Promise<TwitterApiMetadata | undefined> | undefin
 let multiAddCaptureEnabled = false;
 let multiAddCaptureLeftClick = false;
 let multiAddCaptureRightClick = true;
+let multiAddAutoCollectEnabled = false;
 let lastCaptureSignature = "";
 let lastCaptureAt = 0;
+let autoCollectObserver: IntersectionObserver | undefined;
+let autoCollectMutationObserver: MutationObserver | undefined;
+let autoCollectScanTimer: number | undefined;
+let autoCollectObservedElements = new WeakSet<Element>();
+let autoCollectSeenKeys = new Set<string>();
+let autoCollectPendingKeys = new Set<string>();
 
 void refreshMultiAddCaptureState();
 
@@ -196,12 +207,15 @@ async function refreshMultiAddCaptureState(): Promise<void> {
 
 function applyMultiAddCaptureState(message: {
   captureEnabled?: boolean;
+  autoCollectEnabled?: boolean;
   captureLeftClick?: boolean;
   captureRightClick?: boolean;
 }): void {
   multiAddCaptureEnabled = Boolean(message.captureEnabled);
   multiAddCaptureLeftClick = message.captureLeftClick !== false;
   multiAddCaptureRightClick = message.captureRightClick !== false;
+  multiAddAutoCollectEnabled = multiAddCaptureEnabled && Boolean(message.autoCollectEnabled);
+  syncAutoCollectMode();
 }
 
 function shouldCaptureContextMenu(event: MouseEvent, target: Element | undefined): boolean {
@@ -284,6 +298,341 @@ function baseCaptureDraft(event: MouseEvent, target: Element | undefined, eventT
       linkUrl
     }
   };
+}
+
+function syncAutoCollectMode(): void {
+  if (multiAddAutoCollectEnabled) {
+    startAutoCollectMode();
+    return;
+  }
+  stopAutoCollectMode();
+}
+
+function startAutoCollectMode(): void {
+  if (!document.body) {
+    window.setTimeout(syncAutoCollectMode, AUTO_COLLECT_SCAN_DELAY_MS);
+    return;
+  }
+
+  if (!autoCollectObserver) {
+    autoCollectSeenKeys = new Set();
+    autoCollectPendingKeys = new Set();
+    autoCollectObservedElements = new WeakSet<Element>();
+    autoCollectObserver = new IntersectionObserver(handleAutoCollectIntersections, {
+      root: null,
+      rootMargin: AUTO_COLLECT_ROOT_MARGIN,
+      threshold: 0.01
+    });
+  }
+
+  if (!autoCollectMutationObserver) {
+    autoCollectMutationObserver = new MutationObserver(() => scheduleAutoCollectScan());
+    autoCollectMutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  scheduleAutoCollectScan(0);
+}
+
+function stopAutoCollectMode(): void {
+  if (autoCollectScanTimer) {
+    window.clearTimeout(autoCollectScanTimer);
+    autoCollectScanTimer = undefined;
+  }
+  autoCollectObserver?.disconnect();
+  autoCollectMutationObserver?.disconnect();
+  autoCollectObserver = undefined;
+  autoCollectMutationObserver = undefined;
+  autoCollectPendingKeys.clear();
+}
+
+function scheduleAutoCollectScan(delay = AUTO_COLLECT_SCAN_DELAY_MS): void {
+  if (autoCollectScanTimer) window.clearTimeout(autoCollectScanTimer);
+  autoCollectScanTimer = window.setTimeout(() => {
+    autoCollectScanTimer = undefined;
+    scanAutoCollectCandidates();
+  }, delay);
+}
+
+function scanAutoCollectCandidates(): void {
+  if (!multiAddAutoCollectEnabled || !autoCollectObserver) return;
+
+  for (const container of findAutoCollectContainers()) {
+    if (!autoCollectObservedElements.has(container)) {
+      autoCollectObservedElements.add(container);
+      autoCollectObserver.observe(container);
+    }
+
+    if (isElementNearViewport(container)) {
+      void collectAutoCollectContainer(container);
+    }
+  }
+}
+
+function handleAutoCollectIntersections(entries: IntersectionObserverEntry[]): void {
+  if (!multiAddAutoCollectEnabled) return;
+  for (const entry of entries) {
+    if (entry.isIntersecting) {
+      void collectAutoCollectContainer(entry.target);
+    }
+  }
+}
+
+function findAutoCollectContainers(): Element[] {
+  const containers = new Set<Element>();
+  const add = (element: Element | undefined | null): void => {
+    const container = normalizeAutoCollectContainer(element ?? undefined);
+    if (container && isAutoCollectPostContainer(container)) containers.add(container);
+  };
+
+  document.querySelectorAll(
+    [
+      "article[data-testid='tweet']",
+      "[data-testid='cellInnerDiv']",
+      "article",
+      "[role='article']",
+      "[data-scroll-anchor]",
+      "[class*='SkNote-root']",
+      "[class*='MkNote-root']",
+      "[class*='Note-root']",
+      "._panel",
+      "[to^='/notes/']",
+      "[to^='/clips/']",
+      "a[href*='/notes/']",
+      "a[href*='/clips/']"
+    ].join(",")
+  ).forEach(add);
+
+  return Array.from(containers).slice(0, 160);
+}
+
+function normalizeAutoCollectContainer(element: Element | undefined): Element | undefined {
+  if (!element) return undefined;
+
+  const tweet = element.matches("article[data-testid='tweet']")
+    ? element
+    : element.querySelector("article[data-testid='tweet']") ?? element.closest("article[data-testid='tweet']");
+  if (tweet) return tweet;
+
+  const cell = element.closest("[data-testid='cellInnerDiv']") ?? (element.matches("[data-testid='cellInnerDiv']") ? element : undefined);
+  if (cell?.querySelector("a[href*='/status/']")) return cell;
+
+  const post = element.closest(
+    "article, [role='article'], [data-scroll-anchor], [class*='SkNote-root'], [class*='MkNote-root'], [class*='Note-root'], ._panel, [to^='/notes/'], [to^='/clips/']"
+  );
+  if (post) return post;
+
+  return element;
+}
+
+function isAutoCollectPostContainer(container: Element): boolean {
+  return Boolean(autoCollectPostSourceUrl(container) && autoCollectMediaTargets(container).length);
+}
+
+function isElementNearViewport(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+  return rect.bottom >= -700 && rect.top <= viewportHeight + 700 && rect.right >= 0 && rect.left <= viewportWidth;
+}
+
+async function collectAutoCollectContainer(container: Element): Promise<void> {
+  if (!multiAddAutoCollectEnabled) return;
+
+  const sourceUrl = autoCollectPostSourceUrl(container);
+  if (!sourceUrl) return;
+
+  for (const target of autoCollectMediaTargets(container)) {
+    const key = autoCollectQueueKey(container, target, sourceUrl);
+    if (!key || autoCollectSeenKeys.has(key) || autoCollectPendingKeys.has(key)) continue;
+
+    autoCollectPendingKeys.add(key);
+    autoCollectSeenKeys.add(key);
+    void collectAutoCollectTarget(container, target, sourceUrl).finally(() => {
+      autoCollectPendingKeys.delete(key);
+    });
+  }
+}
+
+async function collectAutoCollectTarget(container: Element, target: Element, sourceUrl: string): Promise<void> {
+  try {
+    rememberMisskeyMediaContext(target);
+    const { draft, debug } = await extractDraftWithDebug(baseAutoCollectDraft(container, target, sourceUrl), target);
+    if (!draft.mediaUrl && !draft.previewUrl) return;
+    await chrome.runtime.sendMessage({
+      type: MULTI_ADD_CAPTURED_DRAFT_MESSAGE,
+      draft,
+      debug
+    });
+  } catch {
+    // Auto collect should stay quiet; the next visible post may still extract cleanly.
+  }
+}
+
+function baseAutoCollectDraft(container: Element, target: Element, sourceUrl: string): ImportDraft {
+  const mediaUrl = autoCollectMediaUrl(target);
+  const linkUrl = target.closest<HTMLAnchorElement>("a[href]")?.href;
+  return {
+    pageUrl: location.href,
+    sourceUrl: sourceUrl || linkUrl || location.href,
+    mediaUrl,
+    previewUrl: mediaUrlFromElement(target) || mediaUrl,
+    site: "generic",
+    raw: {
+      multiAdd: true,
+      autoCollect: true,
+      sourceUrl,
+      linkUrl,
+      mediaUrl,
+      containerSource: autoCollectContainerKind(container)
+    }
+  };
+}
+
+function autoCollectPostSourceUrl(container: Element): string | undefined {
+  const candidates: string[] = [];
+  const add = (value: string | undefined | null): void => {
+    const url = absoluteUrl(value, location.origin);
+    if (url) candidates.push(url);
+  };
+
+  add(container.getAttribute("to"));
+  container.querySelectorAll<HTMLElement>("[to^='/notes/'], [to^='/clips/']").forEach((element) => add(element.getAttribute("to")));
+  container.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((anchor) => {
+    const href = absoluteUrl(anchor.getAttribute("href"));
+    if (href && looksLikeAutoCollectPostSource(href)) candidates.push(href);
+  });
+
+  return candidates.find(looksLikeAutoCollectPostSource);
+}
+
+function autoCollectMediaTargets(container: Element): Element[] {
+  const targets: Element[] = [];
+  const seen = new Set<string>();
+  const add = (element: Element | undefined | null): void => {
+    if (!element || isAutoCollectExcludedMediaElement(element)) return;
+    const url = autoCollectMediaUrl(element) || mediaUrlFromElement(element);
+    if (!url || !looksLikeAutoCollectMediaCandidate(url, element)) return;
+    const key = autoCollectElementKey(element, url);
+    if (seen.has(key)) return;
+    seen.add(key);
+    targets.push(element);
+  };
+
+  if (container instanceof HTMLImageElement || container instanceof HTMLVideoElement || container instanceof HTMLAnchorElement) {
+    add(container);
+  }
+
+  container.querySelectorAll<HTMLElement>(
+    [
+      "[data-testid='tweetPhoto'] img",
+      "[data-testid='tweetPhoto'] video",
+      "[data-testid='videoPlayer'] video",
+      "a[href*='/photo/'] img",
+      "a[href*='/files/']",
+      "a[href*='/proxy/']",
+      "a[href*='url=']",
+      ".image a[href]",
+      "[class*='media' i] a[href]",
+      "[class*='Media' i] a[href]",
+      "img[src]",
+      "video[src]",
+      "video source[src]"
+    ].join(",")
+  ).forEach(add);
+
+  return targets.slice(0, MAX_AUTO_COLLECT_TARGETS_PER_POST);
+}
+
+function autoCollectMediaUrl(target: Element): string | undefined {
+  const mediaLink = target instanceof HTMLAnchorElement ? target : target.closest<HTMLAnchorElement>("a[href]");
+  if (mediaLink && looksLikeDirectAutoCollectMediaUrl(mediaLink.href)) return absoluteUrl(mediaLink.href);
+  return mediaUrlFromElement(target);
+}
+
+function autoCollectQueueKey(container: Element, target: Element, sourceUrl: string): string | undefined {
+  const media = autoCollectMediaUrl(target) || mediaUrlFromElement(target);
+  const source = sourceUrl || autoCollectPostSourceUrl(container);
+  return [normalizedAutoCollectKeyPart(source), normalizedAutoCollectKeyPart(media)].filter(Boolean).join("|") || undefined;
+}
+
+function normalizedAutoCollectKeyPart(value: string | undefined): string | undefined {
+  const absolute = absoluteUrl(value);
+  if (!absolute) return undefined;
+  try {
+    const url = new URL(absolute);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return absolute;
+  }
+}
+
+function autoCollectElementKey(element: Element, url: string): string {
+  const photoLink = element.closest<HTMLAnchorElement>("a[href*='/photo/']")?.href;
+  return normalizedAutoCollectKeyPart(photoLink) || normalizedAutoCollectKeyPart(url) || cssPathForElement(element);
+}
+
+function autoCollectContainerKind(container: Element): string {
+  if (container.matches("article[data-testid='tweet'], [data-testid='cellInnerDiv']")) return "x-timeline-post";
+  if (container.matches("[to^='/notes/'], [to^='/clips/'], ._panel, [data-scroll-anchor]")) return "misskey-timeline-post";
+  return "post-container";
+}
+
+function isAutoCollectExcludedMediaElement(element: Element): boolean {
+  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer'], [class*='MkMedia'], [class*='media' i], [class*='Media' i]")) {
+    return false;
+  }
+
+  return Boolean(
+    element.closest(
+      [
+        "nav",
+        "aside",
+        "header",
+        "footer",
+        "[data-testid^='UserAvatar']",
+        "[data-testid='Tweet-User-Avatar']",
+        "[aria-label*='profile picture' i]",
+        "[class*='avatar' i]",
+        "[class*='reaction' i]",
+        "[class*='emoji' i]",
+        "[class*='icon' i]",
+        "[class*='avadeco' i]"
+      ].join(",")
+    )
+  );
+}
+
+function looksLikeAutoCollectPostSource(value: string): boolean {
+  try {
+    const url = new URL(value, location.href);
+    return looksLikePostSource(url.href) || /\/(?:notes|clips)\/[A-Za-z0-9_-]+/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeDirectAutoCollectMediaUrl(value: string): boolean {
+  try {
+    const url = new URL(value, location.href);
+    return isLikelyMediaUrl(url.href) || /\/files\/|\/proxy\//.test(url.pathname) || url.searchParams.has("url");
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeAutoCollectMediaCandidate(value: string, element: Element): boolean {
+  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer']")) return true;
+  if (looksLikeDirectAutoCollectMediaUrl(value)) return true;
+  try {
+    const url = new URL(value, location.href);
+    return url.hostname === "pbs.twimg.com" || url.hostname === "video.twimg.com" || /\/files\//.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 async function extractDraftWithDebug(inputDraft: ImportDraft, target: Element | undefined): Promise<{ draft: ImportDraft; debug: ImportDebugSnapshot }> {

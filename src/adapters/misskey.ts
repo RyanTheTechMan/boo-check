@@ -25,21 +25,23 @@ type MisskeyRememberedRaw = {
   misskeyRememberedContext?: ImportDraft;
 };
 
+const MISSKEY_POST_PATH_RE = /\/(?:notes|clips)\/[A-Za-z0-9_-]+/;
+
 export const misskeyAdapter: SiteAdapter = {
   detect(draft: ImportDraft, target?: Element): boolean {
-    if (draft.pageUrl?.includes("/notes/") || location.pathname.includes("/notes/")) return true;
+    if (misskeyPostUrl(draft.pageUrl) || misskeyPostUrl(draft.sourceUrl) || MISSKEY_POST_PATH_RE.test(location.pathname)) return true;
     const container = findMisskeyNoteContainer(target);
     const targetMediaUrl = directElementUrl(target) || draft.mediaUrl || draft.previewUrl;
     const mediaContainer = targetMediaUrl ? findMisskeyNoteContainerForMedia(targetMediaUrl) : undefined;
     const hasMisskeySignal = Boolean(
-      container?.querySelector("a[href*='/notes/']") ||
-        mediaContainer?.querySelector("a[href*='/notes/']") ||
-        document.querySelector("a[href*='/notes/'], meta[property='misskey:summary'], meta[name='misskey:summary']") ||
+      hasMisskeyNoteLink(container) ||
+        hasMisskeyNoteLink(mediaContainer) ||
+        document.querySelector("a[href*='/notes/'], a[href*='/clips/'], [to^='/notes/'], [to^='/clips/'], meta[property='misskey:summary'], meta[name='misskey:summary']") ||
         rememberedMisskeyContext(draft)
     );
     return Boolean(
-      container?.querySelector("a[href*='/notes/']") ||
-        mediaContainer?.querySelector("a[href*='/notes/']") ||
+      hasMisskeyNoteLink(container) ||
+        hasMisskeyNoteLink(mediaContainer) ||
         document.querySelector("meta[property='misskey:summary'], meta[name='misskey:summary']") ||
         (hasMisskeySignal && (isMisskeyPhotoSwipeTarget(target) || looksLikeMisskeyTarget(target)))
     );
@@ -53,10 +55,10 @@ export const misskeyAdapter: SiteAdapter = {
     const usableRemembered = shouldUseRememberedMisskeyContext(remembered, targetMediaUrl, target);
     const photoSwipeRemembered = isMisskeyPhotoSwipeTarget(target) ? usableRemembered : undefined;
     const noteLink = container
-      ? findFirstLink(container, (href) => /\/notes\/[A-Za-z0-9_-]+/.test(new URL(href).pathname))
+      ? findFirstLink(container, (href) => MISSKEY_POST_PATH_RE.test(new URL(href).pathname))
       : undefined;
     const containerSourceUrl = absoluteUrl(noteLink?.href) || misskeyNoteUrlFromElement(container) || misskeyNoteUrlFromElement(target);
-    const rememberedSourceUrl = misskeyNoteUrl(usableRemembered?.sourceUrl);
+    const rememberedSourceUrl = misskeyPostUrl(usableRemembered?.sourceUrl);
     const sourceUrl = photoSwipeRemembered
       ? rememberedSourceUrl || containerSourceUrl
       : containerSourceUrl || rememberedSourceUrl;
@@ -77,7 +79,7 @@ export const misskeyAdapter: SiteAdapter = {
       ...draft,
       site: "misskey",
       pageUrl: absoluteUrl(draft.pageUrl) || location.href,
-      sourceUrl: sourceUrl || misskeyNoteUrl(draft.sourceUrl) || misskeyNoteUrl(location.href) || absoluteUrl(draft.sourceUrl) || location.href,
+      sourceUrl: sourceUrl || misskeyPostUrl(draft.sourceUrl) || misskeyPostUrl(location.href) || absoluteUrl(draft.sourceUrl) || location.href,
       mediaUrl: mediaSelection.mediaUrl,
       previewUrl: mediaSelection.previewUrl,
       posterName,
@@ -139,7 +141,7 @@ export function rememberedMisskeyContext(draft: ImportDraft): ImportDraft | unde
 export function isUsableMisskeyContext(draft: ImportDraft | undefined): draft is ImportDraft {
   if (!draft) return false;
   return Boolean(
-    misskeyNoteUrl(draft.sourceUrl) ||
+    misskeyPostUrl(draft.sourceUrl) ||
       draft.posterName?.trim() ||
       draft.artistTag?.trim() ||
       draft.caption?.trim() ||
@@ -194,8 +196,12 @@ function normalizeMisskeyNoteContainer(candidate: Element | undefined): Element 
   return undefined;
 }
 
-function hasMisskeyNoteLink(element: Element): boolean {
-  return Boolean(element.querySelector("a[href*='/notes/']"));
+function hasMisskeyNoteLink(element: Element | undefined): boolean {
+  if (!element) return false;
+  return Boolean(
+    element.querySelector("a[href*='/notes/'], a[href*='/clips/'], [to^='/notes/'], [to^='/clips/']") ||
+      misskeyPostUrl(element.getAttribute("to") ?? undefined)
+  );
 }
 
 function findMisskeyNoteContainerForMedia(mediaUrl: string | undefined): Element | undefined {
@@ -620,18 +626,23 @@ function candidateRank(candidate: MisskeyMediaCandidate): number {
   return candidate.score + (candidate.accepted ? 10000 : 0);
 }
 
-function misskeyNoteUrl(value: string | undefined): string | undefined {
+function misskeyPostUrl(value: string | undefined): string | undefined {
   const absolute = absoluteUrl(value);
   if (!absolute) return undefined;
   try {
     const url = new URL(absolute);
-    return /\/notes\/[A-Za-z0-9_-]+/.test(url.pathname) ? url.href : undefined;
+    return MISSKEY_POST_PATH_RE.test(url.pathname) ? url.href : undefined;
   } catch {
     return undefined;
   }
 }
 
 function misskeyNoteUrlFromElement(element: Element | undefined): string | undefined {
+  const postElement = element?.closest("[to^='/notes/'], [to^='/clips/']") ?? element?.querySelector("[to^='/notes/'], [to^='/clips/']");
+  const postTarget = postElement?.getAttribute("to")?.trim();
+  const postUrl = misskeyPostUrl(postTarget);
+  if (postUrl) return postUrl;
+
   const noteRoot = element?.closest("[data-scroll-anchor]") ?? element?.querySelector("[data-scroll-anchor]");
   const noteId = noteRoot?.getAttribute("data-scroll-anchor")?.trim();
   if (!noteId || !/^[A-Za-z0-9_-]{6,}$/.test(noteId)) return undefined;

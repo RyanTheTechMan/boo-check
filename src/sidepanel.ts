@@ -9,6 +9,7 @@ import {
   EXTRACT_PAGE_CONTEXT_MESSAGE,
   IMPORT_QUEUE_STORE_KEY,
   PENDING_IMPORT_KEY,
+  SET_MULTI_ADD_AUTO_COLLECT_MESSAGE,
   SET_MULTI_ADD_CAPTURE_MESSAGE,
   SIDE_PANEL_STATE_KEY
 } from "./constants";
@@ -66,6 +67,7 @@ const els = {
   queuePanel: byId<HTMLElement>("queuePanel"),
   queueSummary: byId<HTMLParagraphElement>("queueSummary"),
   multiAddToggle: byId<HTMLButtonElement>("multiAddToggleButton"),
+  autoCollectToggle: byId<HTMLButtonElement>("autoCollectToggleButton"),
   importQueue: byId<HTMLButtonElement>("importQueueButton"),
   importQueueAuto: byId<HTMLButtonElement>("importQueueAutoButton"),
   clearQueue: byId<HTMLButtonElement>("clearQueueButton"),
@@ -191,6 +193,7 @@ function bindEvents(): void {
   els.saveSettings.addEventListener("click", () => void persistSettings());
   els.clearState.addEventListener("click", () => void clearSidePanelState());
   els.multiAddToggle.addEventListener("click", () => void toggleMultiAddCapture());
+  els.autoCollectToggle.addEventListener("click", () => void toggleAutoCollect());
   els.importQueue.addEventListener("click", () => void importQueueNoAi());
   els.importQueueAuto.addEventListener("click", () => void importQueueAiAuto());
   els.clearQueue.addEventListener("click", () => void clearQueue());
@@ -592,6 +595,7 @@ function normalizeQueueState(tabId: number, state: ImportQueueState | undefined)
   return {
     tabId,
     captureEnabled: Boolean(state?.captureEnabled),
+    autoCollectEnabled: Boolean(state?.captureEnabled && state.autoCollectEnabled),
     selectedItemId,
     items,
     updatedAt: state?.updatedAt ?? Date.now()
@@ -955,6 +959,50 @@ async function setMultiAddCapture(captureEnabled: boolean): Promise<void> {
   }
 }
 
+async function toggleAutoCollect(): Promise<void> {
+  if (!currentQueue) await loadQueueForCurrentTab();
+  if (!currentQueue) {
+    setStatus("No active tab available for auto collect.", "error");
+    return;
+  }
+  if (!currentQueue.captureEnabled) {
+    setStatus("Enable multi-add before auto collect.", "info");
+    return;
+  }
+
+  await setAutoCollect(!currentQueue.autoCollectEnabled);
+}
+
+async function setAutoCollect(autoCollectEnabled: boolean): Promise<void> {
+  if (!currentQueue) return;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: SET_MULTI_ADD_AUTO_COLLECT_MESSAGE,
+      tabId: currentQueue.tabId,
+      autoCollectEnabled
+    });
+    if (response?.ok && response.queue) {
+      currentQueue = response.queue as ImportQueueState;
+    } else {
+      currentQueue = {
+        ...currentQueue,
+        autoCollectEnabled: autoCollectEnabled && currentQueue.captureEnabled,
+        updatedAt: Date.now()
+      };
+      await persistQueueStateNow();
+    }
+    renderQueue();
+    setStatus(
+      currentQueue.autoCollectEnabled
+        ? "Auto collect is watching visible posts in this tab."
+        : "Auto collect stopped.",
+      "info"
+    );
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "Could not update auto collect.", "error");
+  }
+}
+
 async function syncCaptureStateToActiveTab(): Promise<void> {
   if (!currentQueue?.captureEnabled) return;
   await setMultiAddCapture(true);
@@ -964,10 +1012,14 @@ function renderQueue(): void {
   const queue = currentQueue;
   const items = queue?.items ?? [];
   const captureEnabled = Boolean(queue?.captureEnabled);
+  const autoCollectEnabled = Boolean(captureEnabled && queue?.autoCollectEnabled);
   els.queuePanel.hidden = !captureEnabled && items.length <= 1;
   els.multiAddToggle.textContent = captureEnabled ? "Disable multi-add" : "Enable multi-add";
   els.multiAddToggle.dataset.active = String(captureEnabled);
-  els.queueSummary.textContent = queueSummaryText(items.length, captureEnabled);
+  els.autoCollectToggle.textContent = autoCollectEnabled ? "Stop auto collect" : "Auto collect visible";
+  els.autoCollectToggle.dataset.active = String(autoCollectEnabled);
+  els.queueSummary.textContent = queueSummaryText(items.length, captureEnabled, autoCollectEnabled);
+  els.autoCollectToggle.disabled = busy || !captureEnabled;
   els.importQueue.disabled = busy || !items.length;
   els.importQueueAuto.disabled = busy || !items.length;
   els.clearQueue.disabled = busy || !items.length;
@@ -988,8 +1040,9 @@ function renderQueue(): void {
   scheduleQueueMetadataHydration(items);
 }
 
-function queueSummaryText(count: number, captureEnabled: boolean): string {
+function queueSummaryText(count: number, captureEnabled: boolean, autoCollectEnabled: boolean): string {
   const itemText = `${count} queued item${count === 1 ? "" : "s"}`;
+  if (autoCollectEnabled) return `${itemText} - auto collect is on`;
   return captureEnabled ? `${itemText} - capture is on` : itemText;
 }
 
@@ -2221,7 +2274,17 @@ function handleError(error: unknown): void {
 
 function setBusy(nextBusy: boolean): void {
   busy = nextBusy;
-  for (const button of [els.import, els.importAuto, els.importManual, els.saveFinal, els.importQueue, els.importQueueAuto, els.clearQueue, els.multiAddToggle]) {
+  for (const button of [
+    els.import,
+    els.importAuto,
+    els.importManual,
+    els.saveFinal,
+    els.importQueue,
+    els.importQueueAuto,
+    els.clearQueue,
+    els.multiAddToggle,
+    els.autoCollectToggle
+  ]) {
     button.disabled = nextBusy;
   }
 }

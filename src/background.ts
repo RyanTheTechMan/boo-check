@@ -4,6 +4,7 @@ import {
   GET_MULTI_ADD_CAPTURE_STATE_MESSAGE,
   IMPORT_QUEUE_STORE_KEY,
   MULTI_ADD_CAPTURED_DRAFT_MESSAGE,
+  SET_MULTI_ADD_AUTO_COLLECT_MESSAGE,
   SET_MULTI_ADD_CAPTURE_MESSAGE,
   PENDING_IMPORT_KEY
 } from "./constants";
@@ -34,6 +35,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === SET_MULTI_ADD_CAPTURE_MESSAGE) {
     void handleSetMultiAddCapture(message, sender, sendResponse);
+    return true;
+  }
+
+  if (message?.type === SET_MULTI_ADD_AUTO_COLLECT_MESSAGE) {
+    void handleSetMultiAddAutoCollect(message, sender, sendResponse);
     return true;
   }
 
@@ -70,6 +76,7 @@ async function handleGetMultiAddCaptureState(
   sendResponse({
     ok: true,
     captureEnabled: queue.captureEnabled,
+    autoCollectEnabled: queue.autoCollectEnabled,
     captureLeftClick: settings.multiAddCaptureLeftClick,
     captureRightClick: settings.multiAddCaptureRightClick
   });
@@ -90,10 +97,32 @@ async function handleSetMultiAddCapture(
   const queue = await updateQueueState(tabId, (state) => ({
     ...state,
     captureEnabled,
+    autoCollectEnabled: captureEnabled ? state.autoCollectEnabled : false,
     updatedAt: Date.now()
   }));
 
-  await sendCaptureStateToTab(tabId, captureEnabled);
+  await sendCaptureStateToTab(tabId, queue);
+  sendResponse({ ok: true, queue });
+}
+
+async function handleSetMultiAddAutoCollect(
+  message: { tabId?: number; autoCollectEnabled?: boolean },
+  sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: unknown) => void
+): Promise<void> {
+  const tabId = typeof message.tabId === "number" ? message.tabId : sender.tab?.id;
+  if (typeof tabId !== "number") {
+    sendResponse({ ok: false, error: "No tab id." });
+    return;
+  }
+
+  const queue = await updateQueueState(tabId, (state) => ({
+    ...state,
+    autoCollectEnabled: Boolean(message.autoCollectEnabled) && state.captureEnabled,
+    updatedAt: Date.now()
+  }));
+
+  await sendCaptureStateToTab(tabId, queue);
   sendResponse({ ok: true, queue });
 }
 
@@ -112,12 +141,13 @@ async function handleCapturedQueueDraft(
   sendResponse({ ok: true, ...result });
 }
 
-async function sendCaptureStateToTab(tabId: number, captureEnabled: boolean): Promise<void> {
+async function sendCaptureStateToTab(tabId: number, queue: ImportQueueState): Promise<void> {
   const settings = await loadSettings();
   try {
     await chrome.tabs.sendMessage(tabId, {
       type: SET_MULTI_ADD_CAPTURE_MESSAGE,
-      captureEnabled,
+      captureEnabled: queue.captureEnabled,
+      autoCollectEnabled: queue.autoCollectEnabled,
       captureLeftClick: settings.multiAddCaptureLeftClick,
       captureRightClick: settings.multiAddCaptureRightClick
     });
@@ -328,6 +358,7 @@ function normalizeQueueState(tabId: number, state: ImportQueueState | undefined)
   return {
     tabId,
     captureEnabled: Boolean(state?.captureEnabled),
+    autoCollectEnabled: Boolean(state?.captureEnabled && state.autoCollectEnabled),
     selectedItemId: state?.selectedItemId,
     items: Array.isArray(state?.items) ? state.items : [],
     updatedAt: state?.updatedAt ?? Date.now()
