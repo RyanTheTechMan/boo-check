@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boo Check</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Boo Check</h1>
+          <p id="siteLabel">Ready</p>
+        </div>
+      </header>
+
+      <section id="status" class="status" aria-live="polite"></section>
+
+      <section class="utility-actions">
+        <button id="clearStateButton" type="button">Clear Side Panel</button>
+      </section>
+
+      <section class="preview-panel">
+        <div id="preview" class="preview"></div>
+        <div id="mediaMetadata" class="media-metadata" aria-live="polite"></div>
+      </section>
+
+      <section class="form-grid">
+        <label>
+          <span>Source URL</span>
+          <input id="sourceInput" type="url" autocomplete="off" spellcheck="false" />
+        </label>
+
+        <label class="artist-label">
+          <span>Artist</span>
+          <input id="artistInput" type="text" autocomplete="off" spellcheck="false" />
+          <div id="artistStatus" class="field-status" aria-live="polite"></div>
+          <div id="artistAutocomplete" class="autocomplete hidden" role="listbox"></div>
+        </label>
+
+        <label>
+          <span>Rating</span>
+          <select id="ratingInput">
+            <option value="safe">safe</option>
+            <option value="questionable">questionable</option>
+            <option value="explicit">explicit</option>
+          </select>
+        </label>
+
+        <div class="tags-label">
+          <label for="tagsInput">Tags</label>
+          <textarea id="tagsInput" rows="5" autocomplete="off" spellcheck="false"></textarea>
+          <label class="check-row tag-option-row">
+            <input id="includeHashtagsInput" type="checkbox" />
+            <span>Add hashtags from post</span>
+          </label>
+          <div id="autocomplete" class="autocomplete hidden" role="listbox"></div>
+        </div>
+
+        <div id="tagChips" class="tag-chips"></div>
+      </section>
+
+      <section id="importActions" class="actions">
+        <button id="importButton" type="button">Import</button>
+        <button id="importAutoButton" type="button">Import + AI Auto</button>
+        <button id="importManualButton" type="button">Import + AI Manual</button>
+      </section>
+
+      <section id="manualAiPanel" class="manual-ai hidden">
+        <header>
+          <h2>AI Suggestions</h2>
+          <p id="manualAiSummary"></p>
+        </header>
+        <div id="manualAiList" class="manual-ai-list"></div>
+        <div class="actions secondary-actions">
+          <button id="saveFinalButton" type="button">Save Final Tags</button>
+        </div>
+      </section>
+
+      <div id="successPopup" class="modal-backdrop" hidden>
+        <section class="success-modal" role="dialog" aria-modal="true" aria-live="polite" aria-labelledby="successTitle">
+          <button id="successCloseButton" class="modal-close" type="button" aria-label="Close import result">x</button>
+          <div>
+            <h2 id="successTitle"></h2>
+            <p id="successMessage"></p>
+            <p id="successCountdown" class="success-countdown" hidden></p>
+          </div>
+          <label class="check-row success-clear-row">
+            <input id="successClearPanel" type="checkbox" />
+            <span>Clear side panel after closing this popup</span>
+          </label>
+          <div class="success-actions">
+            <a id="successOpenLink" class="button-link" target="_blank" rel="noreferrer" hidden>Open in Blombooru</a>
+            <button id="successStayButton" type="button" hidden>Stay open</button>
+          </div>
+        </section>
+      </div>
+
+      <section id="debugPanel" class="debug-panel" hidden>
+        <header>
+          <h2>Debug</h2>
+          <p>This report includes page and media URLs, but not your API key.</p>
+        </header>
+        <div class="debug-actions">
+          <button id="copyDebugButton" type="button">Copy Debug Report</button>
+          <span id="debugCopyFeedback" aria-live="polite"></span>
+        </div>
+        <div id="debugSummary" class="debug-summary"></div>
+        <pre id="debugPreview"></pre>
+      </section>
+
+      <details id="settingsPanel" class="settings-panel">
+        <summary>Settings</summary>
+        <div class="settings-grid">
+          <label>
+            <span>Blombooru base URL</span>
+            <input id="baseUrlSetting" type="url" placeholder="http://10.10.1.149:8000" spellcheck="false" />
+          </label>
+          <label>
+            <span>Blombooru API key</span>
+            <input id="apiKeySetting" type="password" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            <span>Default rating</span>
+            <select id="defaultRatingSetting">
+              <option value="safe">safe</option>
+              <option value="questionable">questionable</option>
+              <option value="explicit">explicit</option>
+            </select>
+          </label>
+          <label>
+            <span>AI model name</span>
+            <input id="aiModelSetting" type="text" spellcheck="false" />
+          </label>
+          <label>
+            <span>Auto general threshold</span>
+            <input id="generalThresholdSetting" type="number" min="0" max="1" step="0.01" />
+          </label>
+          <label>
+            <span>Auto character threshold</span>
+            <input id="characterThresholdSetting" type="number" min="0" max="1" step="0.01" />
+          </label>
+          <label class="check-row">
+            <input id="hideRatingTagsSetting" type="checkbox" />
+            <span>Hide AI rating tags</span>
+          </label>
+          <p class="field-help">AI rating tags such as safe, questionable, and explicit are always ignored because the Rating selector handles them.</p>
+          <label class="check-row">
+            <input id="includePostHashtagsDefaultSetting" type="checkbox" />
+            <span>Add post hashtags by default</span>
+          </label>
+          <label class="check-row">
+            <input id="closeAfterImportSetting" type="checkbox" />
+            <span>Close side panel after import</span>
+          </label>
+          <label class="check-row">
+            <input id="clearPanelAfterImportDefaultSetting" type="checkbox" />
+            <span>Check clear side panel by default</span>
+          </label>
+          <label>
+            <span>Misskey artist</span>
+            <select id="misskeyArtistModeSetting">
+              <option value="username-only">Artist name only</option>
+              <option value="append-domain">Append domain to artist</option>
+              <option value="domain-tag">Artist name, domain as tag</option>
+            </select>
+          </label>
+          <label class="check-row">
+            <input id="debugModeSetting" type="checkbox" />
+            <span>Debug mode</span>
+          </label>
+          <p class="field-help">Shows a copyable report for troubleshooting site extraction. It includes page/media URLs but not your API key.</p>
+          <div class="settings-actions">
+            <button id="saveSettingsButton" type="button">Save Settings</button>
+            <span id="settingsSaveFeedback" class="settings-feedback" aria-live="polite"></span>
+          </div>
+        </div>
+      </details>
+    </main>
+    <script type="module" src="./sidepanel.ts"></script>
+  </body>
+</html>

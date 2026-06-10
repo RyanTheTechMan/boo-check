@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boo Check Settings</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell options-shell">
+      <header class="topbar">
+        <div>
+          <h1>Boo Check</h1>
+          <p>Settings</p>
+        </div>
+      </header>
+      <section id="status" class="status" aria-live="polite"></section>
+      <section class="settings-panel standalone">
+        <div class="settings-grid">
+          <label>
+            <span>Blombooru base URL</span>
+            <input id="baseUrlSetting" type="url" placeholder="http://10.10.1.149:8000" spellcheck="false" />
+          </label>
+          <label>
+            <span>Blombooru API key</span>
+            <input id="apiKeySetting" type="password" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            <span>Default rating</span>
+            <select id="defaultRatingSetting">
+              <option value="safe">safe</option>
+              <option value="questionable">questionable</option>
+              <option value="explicit">explicit</option>
+            </select>
+          </label>
+          <label>
+            <span>AI model name</span>
+            <input id="aiModelSetting" type="text" spellcheck="false" />
+          </label>
+          <label>
+            <span>Auto general threshold</span>
+            <input id="generalThresholdSetting" type="number" min="0" max="1" step="0.01" />
+          </label>
+          <label>
+            <span>Auto character threshold</span>
+            <input id="characterThresholdSetting" type="number" min="0" max="1" step="0.01" />
+          </label>
+          <label class="check-row">
+            <input id="hideRatingTagsSetting" type="checkbox" />
+            <span>Hide AI rating tags</span>
+          </label>
+          <p class="field-help">AI rating tags such as safe, questionable, and explicit are always ignored because the Rating selector handles them.</p>
+          <label class="check-row">
+            <input id="includePostHashtagsDefaultSetting" type="checkbox" />
+            <span>Add post hashtags by default</span>
+          </label>
+          <label class="check-row">
+            <input id="closeAfterImportSetting" type="checkbox" />
+            <span>Close side panel after import</span>
+          </label>
+          <label class="check-row">
+            <input id="clearPanelAfterImportDefaultSetting" type="checkbox" />
+            <span>Check clear side panel by default</span>
+          </label>
+          <label>
+            <span>Misskey artist</span>
+            <select id="misskeyArtistModeSetting">
+              <option value="username-only">Artist name only</option>
+              <option value="append-domain">Append domain to artist</option>
+              <option value="domain-tag">Artist name, domain as tag</option>
+            </select>
+          </label>
+          <label class="check-row">
+            <input id="debugModeSetting" type="checkbox" />
+            <span>Debug mode</span>
+          </label>
+          <p class="field-help">Shows a copyable report for troubleshooting site extraction. It includes page/media URLs but not your API key.</p>
+          <div class="settings-actions">
+            <button id="saveSettingsButton" type="button">Save Settings</button>
+            <span id="settingsSaveFeedback" class="settings-feedback" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./options.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "boo-check",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "tsc --noEmit && vite build"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^25.9.2",
+    "typescript": "^5.4.5",
+    "vite": "^8.0.16"
+  }
+}
