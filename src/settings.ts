@@ -14,6 +14,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   closeAfterImport: false,
   clearPanelAfterImportDefault: false,
   misskeyArtistMode: "username-only",
+  fourChanTagMode: "none",
   sidePanelImageBlurMode: "off",
   multiAddCaptureLeftClick: false,
   multiAddCaptureRightClick: true,
@@ -46,6 +47,7 @@ export function normalizeSettings(value: Partial<AppSettings> | undefined): AppS
     closeAfterImport: Boolean(legacyValue?.closeAfterImport ?? legacyValue?.closeAfterAiAuto ?? DEFAULT_SETTINGS.closeAfterImport),
     clearPanelAfterImportDefault: Boolean(settings.clearPanelAfterImportDefault),
     misskeyArtistMode: isMisskeyArtistMode(settings.misskeyArtistMode) ? settings.misskeyArtistMode : DEFAULT_SETTINGS.misskeyArtistMode,
+    fourChanTagMode: isFourChanTagMode(settings.fourChanTagMode) ? settings.fourChanTagMode : DEFAULT_SETTINGS.fourChanTagMode,
     sidePanelImageBlurMode: isSidePanelImageBlurMode(settings.sidePanelImageBlurMode) ? settings.sidePanelImageBlurMode : DEFAULT_SETTINGS.sidePanelImageBlurMode,
     multiAddCaptureLeftClick: settingBoolean(settings.multiAddCaptureLeftClick, DEFAULT_SETTINGS.multiAddCaptureLeftClick),
     multiAddCaptureRightClick: settingBoolean(settings.multiAddCaptureRightClick, DEFAULT_SETTINGS.multiAddCaptureRightClick),
@@ -59,6 +61,10 @@ function isRating(value: unknown): value is AppSettings["defaultRating"] {
 
 function isMisskeyArtistMode(value: unknown): value is AppSettings["misskeyArtistMode"] {
   return value === "append-domain" || value === "username-only" || value === "domain-tag";
+}
+
+function isFourChanTagMode(value: unknown): value is AppSettings["fourChanTagMode"] {
+  return value === "none" || value === "site" || value === "board" || value === "site-and-board";
 }
 
 function isSidePanelImageBlurMode(value: unknown): value is AppSettings["sidePanelImageBlurMode"] {

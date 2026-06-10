@@ -54,14 +54,23 @@
           <div id="artistAutocomplete" class="autocomplete hidden" role="listbox"></div>
         </label>
 
-        <label>
-          <span>Rating</span>
-          <select id="ratingInput">
-            <option value="safe">safe</option>
-            <option value="questionable">questionable</option>
-            <option value="explicit">explicit</option>
-          </select>
-        </label>
+        <fieldset class="rating-field">
+          <legend>Rating</legend>
+          <div id="ratingInput" class="rating-options" role="radiogroup" aria-label="Rating">
+            <label class="rating-option">
+              <input type="radio" name="rating" value="safe" checked />
+              <span>safe</span>
+            </label>
+            <label class="rating-option">
+              <input type="radio" name="rating" value="questionable" />
+              <span>questionable</span>
+            </label>
+            <label class="rating-option">
+              <input type="radio" name="rating" value="explicit" />
+              <span>explicit</span>
+            </label>
+          </div>
+        </fieldset>
 
         <div class="tags-label">
           <label for="tagsInput">Tags</label>
@@ -179,6 +188,15 @@
               <option value="username-only">Artist name only</option>
               <option value="append-domain">Append domain to artist</option>
               <option value="domain-tag">Artist name, domain as tag</option>
+            </select>
+          </label>
+          <label>
+            <span>4chan tags</span>
+            <select id="fourChanTagModeSetting">
+              <option value="none">No 4chan tags</option>
+              <option value="site">4chan</option>
+              <option value="board">Board tag</option>
+              <option value="site-and-board">4chan + board tag</option>
             </select>
           </label>
           <label>

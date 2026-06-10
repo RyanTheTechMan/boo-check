@@ -398,6 +398,80 @@ label,
   font-size: 12px;
 }
 
+.rating-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  color: var(--muted);
+}
+
+.rating-field legend {
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.rating-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rating-option {
+  position: relative;
+  display: inline-flex;
+  flex: 1 1 92px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.rating-option input {
+  position: absolute;
+  width: 1px;
+  min-height: 0;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+}
+
+.rating-option span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 8px;
+  background: #0d0f12;
+  color: var(--muted);
+  line-height: 1.2;
+  text-align: center;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.rating-option:hover span {
+  border-color: var(--accent);
+}
+
+.rating-option input:checked + span {
+  border-color: var(--accent);
+  background: rgba(33, 150, 243, 0.16);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(106, 183, 255, 0.18);
+}
+
+.rating-option input:focus-visible + span {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(106, 183, 255, 0.16);
+}
+
 .field-help {
   margin: -6px 0 2px;
   color: var(--muted);

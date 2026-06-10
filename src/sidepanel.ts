@@ -78,7 +78,7 @@ const els = {
   artist: byId<HTMLInputElement>("artistInput"),
   artistStatus: byId<HTMLDivElement>("artistStatus"),
   artistAutocomplete: byId<HTMLDivElement>("artistAutocomplete"),
-  rating: byId<HTMLSelectElement>("ratingInput"),
+  rating: byId<HTMLDivElement>("ratingInput"),
   tags: byId<HTMLTextAreaElement>("tagsInput"),
   includeHashtags: byId<HTMLInputElement>("includeHashtagsInput"),
   chips: byId<HTMLDivElement>("tagChips"),
@@ -103,6 +103,7 @@ const els = {
   closeAfterImport: byId<HTMLInputElement>("closeAfterImportSetting"),
   clearPanelAfterImportDefault: byId<HTMLInputElement>("clearPanelAfterImportDefaultSetting"),
   misskeyArtistMode: byId<HTMLSelectElement>("misskeyArtistModeSetting"),
+  fourChanTagMode: byId<HTMLSelectElement>("fourChanTagModeSetting"),
   sidePanelImageBlurMode: byId<HTMLSelectElement>("sidePanelImageBlurModeSetting"),
   multiAddCaptureLeftClick: byId<HTMLInputElement>("multiAddCaptureLeftClickSetting"),
   multiAddCaptureRightClick: byId<HTMLInputElement>("multiAddCaptureRightClickSetting"),
@@ -158,6 +159,7 @@ const categoryCache = new Map<string, string>();
 const queueMetadataRequests = new Set<string>();
 const removedQueueItemIds = new Set<string>();
 const queueClearCutoffs = new Map<number, number>();
+const RATING_VALUES: readonly Rating[] = ["safe", "questionable", "explicit"];
 
 void init();
 
@@ -277,6 +279,20 @@ function bindEvents(): void {
   });
 }
 
+function getRating(): Rating {
+  const selected = els.rating.querySelector<HTMLInputElement>('input[name="rating"]:checked');
+  return isRatingValue(selected?.value) ? selected.value : settings.defaultRating;
+}
+
+function setRating(value: Rating): void {
+  const selected = els.rating.querySelector<HTMLInputElement>(`input[name="rating"][value="${value}"]`);
+  if (selected) selected.checked = true;
+}
+
+function isRatingValue(value: string | undefined): value is Rating {
+  return RATING_VALUES.includes(value as Rating);
+}
+
 async function restoreInitialState(): Promise<boolean> {
   const [pending, saved] = await Promise.all([readPendingImport(), readSavedSidePanelState()]);
 
@@ -327,7 +343,7 @@ function restoreSavedSidePanelState(saved: SavedSidePanelState): void {
 
   els.source.value = saved.form?.source ?? draft.sourceUrl ?? draft.pageUrl ?? "";
   els.artist.value = saved.form?.artist ?? draft.artistTag ?? "";
-  els.rating.value = saved.form?.rating ?? draft.rating ?? settings.defaultRating;
+  setRating(saved.form?.rating ?? draft.rating ?? settings.defaultRating);
   els.includeHashtags.checked = saved.form?.includePostHashtags ?? settings.includePostHashtagsDefault;
   els.tags.value = saved.form?.tags ?? "";
   scheduleArtistStatus();
@@ -366,7 +382,7 @@ function buildSavedSidePanelState(): SavedSidePanelState {
     form: {
       source: els.source.value,
       artist: els.artist.value,
-      rating: els.rating.value as Rating,
+      rating: getRating(),
       tags: els.tags.value,
       includePostHashtags: els.includeHashtags.checked
     },
@@ -444,7 +460,7 @@ async function clearSidePanelState(options: { showStatus?: boolean } = {}): Prom
   els.artist.value = "";
   clearArtistStatus();
   hideArtistAutocomplete();
-  els.rating.value = settings.defaultRating;
+  setRating(settings.defaultRating);
   els.includeHashtags.checked = settings.includePostHashtagsDefault;
   els.tags.value = "";
   els.manualPanel.classList.add("hidden");
@@ -1478,7 +1494,7 @@ function applyDraftToForm(options: { preserveEditedTags?: boolean } = {}): void 
   const form = defaultFormForDraft(draft, els.includeHashtags.checked);
   els.source.value = form.source;
   els.artist.value = form.artist;
-  els.rating.value = form.rating;
+  setRating(form.rating);
 
   if (!options.preserveEditedTags || !els.tags.value.trim()) {
     els.tags.value = form.tags;
@@ -1504,7 +1520,7 @@ function currentFormState(): ImportFormState {
   return {
     source: els.source.value,
     artist: els.artist.value,
-    rating: els.rating.value as Rating,
+    rating: getRating(),
     tags: els.tags.value,
     includePostHashtags: els.includeHashtags.checked
   };
@@ -1513,14 +1529,19 @@ function currentFormState(): ImportFormState {
 function applyFormState(form: ImportFormState): void {
   els.source.value = form.source;
   els.artist.value = form.artist;
-  els.rating.value = form.rating;
+  setRating(form.rating);
   els.tags.value = form.tags;
   els.includeHashtags.checked = form.includePostHashtags ?? settings.includePostHashtagsDefault;
   scheduleArtistStatus();
 }
 
 function defaultTagListForDraft(nextDraft: ImportDraft, includeHashtags: boolean, domainTag: string | undefined): string[] {
-  return mergeTags(nonHashtagSeedTags(nextDraft), includeHashtags ? nextDraft.hashtags : undefined, domainTag ? [domainTag] : []);
+  return mergeTags(
+    nonHashtagSeedTags(nextDraft),
+    includeHashtags ? nextDraft.hashtags : undefined,
+    domainTag ? [domainTag] : [],
+    fourChanTagsForDraft(nextDraft)
+  );
 }
 
 function nonHashtagSeedTags(nextDraft = draft): string[] {
@@ -1580,6 +1601,32 @@ function splitMisskeyHandle(value: string): { username: string; domain?: string 
 function normalizeMisskeyDomainTag(domain: string | undefined): string | undefined {
   if (!domain) return undefined;
   return normalizeTag(domain.replace(/\./g, "_"));
+}
+
+function fourChanTagsForDraft(nextDraft: ImportDraft): string[] {
+  if (nextDraft.site !== "4chan" || settings.fourChanTagMode === "none") return [];
+
+  const boardTag = fourChanBoardTag(nextDraft.sourceUrl || nextDraft.pageUrl);
+  if (settings.fourChanTagMode === "site") return ["4chan"];
+  if (settings.fourChanTagMode === "board") return boardTag ? [boardTag] : [];
+  return boardTag ? ["4chan", boardTag] : ["4chan"];
+}
+
+function fourChanBoardTag(value: string | undefined): string | undefined {
+  const board = fourChanBoardCode(value);
+  return board ? normalizeTag(`4chan_${board}`) : undefined;
+}
+
+function fourChanBoardCode(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    const match = url.pathname.match(/^\/([A-Za-z0-9]+)\/thread\/\d+/);
+    return match?.[1]?.toLowerCase();
+  } catch {
+    return undefined;
+  }
 }
 
 function renderAll(): void {
@@ -1852,6 +1899,7 @@ async function persistSettings(): Promise<void> {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    fourChanTagMode: els.fourChanTagMode.value as AppSettings["fourChanTagMode"],
     sidePanelImageBlurMode: els.sidePanelImageBlurMode.value as AppSettings["sidePanelImageBlurMode"],
     multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
     multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
@@ -1877,6 +1925,7 @@ function renderSettings(nextSettings: AppSettings): void {
   els.closeAfterImport.checked = nextSettings.closeAfterImport;
   els.clearPanelAfterImportDefault.checked = nextSettings.clearPanelAfterImportDefault;
   els.misskeyArtistMode.value = nextSettings.misskeyArtistMode;
+  els.fourChanTagMode.value = nextSettings.fourChanTagMode;
   els.sidePanelImageBlurMode.value = nextSettings.sidePanelImageBlurMode;
   els.multiAddCaptureLeftClick.checked = nextSettings.multiAddCaptureLeftClick;
   els.multiAddCaptureRightClick.checked = nextSettings.multiAddCaptureRightClick;
@@ -2091,7 +2140,7 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
   return {
     tags,
     categoryHints,
-    rating: els.rating.value as Rating,
+    rating: getRating(),
     source: els.source.value.trim()
   };
 }
@@ -2497,6 +2546,7 @@ function buildDebugReport(): Record<string, unknown> {
       closeAfterImport: settings.closeAfterImport,
       clearPanelAfterImportDefault: settings.clearPanelAfterImportDefault,
       misskeyArtistMode: settings.misskeyArtistMode,
+      fourChanTagMode: settings.fourChanTagMode,
       sidePanelImageBlurMode: settings.sidePanelImageBlurMode,
       debugMode: settings.debugMode,
       apiKeyConfigured: Boolean(settings.apiKey)
@@ -2504,7 +2554,7 @@ function buildDebugReport(): Record<string, unknown> {
     form: {
       source: els.source.value,
       artist: els.artist.value,
-      rating: els.rating.value,
+      rating: getRating(),
       includePostHashtags: els.includeHashtags.checked,
       tags: els.tags.value,
       parsedTags: parseTagsWithHints(els.tags.value).tags

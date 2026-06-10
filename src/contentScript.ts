@@ -1,4 +1,5 @@
 import { extractImportDraft } from "./adapters";
+import { fourChanThreadUrl } from "./adapters/fourChan";
 import {
   activeMisskeyPhotoSwipeImage,
   attachMisskeyRememberedContext,
@@ -398,6 +399,11 @@ function findAutoCollectContainers(): Element[] {
       "[class*='MkNote-root']",
       "[class*='Note-root']",
       "._panel",
+      ".opContainer",
+      ".replyContainer",
+      ".postContainer",
+      ".post",
+      "a.fileThumb[href]",
       "[to^='/notes/']",
       "[to^='/clips/']",
       "a[href*='/notes/']",
@@ -418,6 +424,11 @@ function normalizeAutoCollectContainer(element: Element | undefined): Element | 
 
   const cell = element.closest("[data-testid='cellInnerDiv']") ?? (element.matches("[data-testid='cellInnerDiv']") ? element : undefined);
   if (cell?.querySelector("a[href*='/status/']")) return cell;
+
+  const fourChanPost = element.matches(".post, .opContainer, .replyContainer, .postContainer")
+    ? element
+    : element.closest(".post, .opContainer, .replyContainer, .postContainer");
+  if (fourChanPost?.querySelector("a.fileThumb[href], .fileText a[href]")) return fourChanPost;
 
   const post = element.closest(
     "article, [role='article'], [data-scroll-anchor], [class*='SkNote-root'], [class*='MkNote-root'], [class*='Note-root'], ._panel, [to^='/notes/'], [to^='/clips/']"
@@ -498,6 +509,7 @@ function autoCollectPostSourceUrl(container: Element): string | undefined {
     if (url) candidates.push(url);
   };
 
+  add(fourChanThreadUrl(location.href));
   add(container.getAttribute("to"));
   container.querySelectorAll<HTMLElement>("[to^='/notes/'], [to^='/clips/']").forEach((element) => add(element.getAttribute("to")));
   container.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((anchor) => {
@@ -534,6 +546,8 @@ function autoCollectMediaTargets(container: Element): Element[] {
       "a[href*='/files/']",
       "a[href*='/proxy/']",
       "a[href*='url=']",
+      "a.fileThumb[href]",
+      ".fileText a[href]",
       ".image a[href]",
       "[class*='media' i] a[href]",
       "[class*='Media' i] a[href]",
@@ -577,12 +591,13 @@ function autoCollectElementKey(element: Element, url: string): string {
 
 function autoCollectContainerKind(container: Element): string {
   if (container.matches("article[data-testid='tweet'], [data-testid='cellInnerDiv']")) return "x-timeline-post";
+  if (container.matches(".post, .opContainer, .replyContainer, .postContainer")) return "4chan-thread-post";
   if (container.matches("[to^='/notes/'], [to^='/clips/'], ._panel, [data-scroll-anchor]")) return "misskey-timeline-post";
   return "post-container";
 }
 
 function isAutoCollectExcludedMediaElement(element: Element): boolean {
-  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer'], [class*='MkMedia'], [class*='media' i], [class*='Media' i]")) {
+  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer'], a.fileThumb, .file, .fileText, [class*='MkMedia'], [class*='media' i], [class*='Media' i]")) {
     return false;
   }
 
@@ -609,7 +624,11 @@ function isAutoCollectExcludedMediaElement(element: Element): boolean {
 function looksLikeAutoCollectPostSource(value: string): boolean {
   try {
     const url = new URL(value, location.href);
-    return looksLikePostSource(url.href) || /\/(?:notes|clips)\/[A-Za-z0-9_-]+/.test(url.pathname);
+    return Boolean(
+      looksLikePostSource(url.href) ||
+        /\/(?:notes|clips)\/[A-Za-z0-9_-]+/.test(url.pathname) ||
+        fourChanThreadUrl(url.href)
+    );
   } catch {
     return false;
   }
@@ -1329,7 +1348,7 @@ function isLikelyMediaUrl(value: string): boolean {
 function looksLikePostSource(value: string): boolean {
   try {
     const url = new URL(value);
-    return /\/status\/\d+|\/notes\/[A-Za-z0-9_-]+|\/posts?\/\d+|\/post\/show\/\d+|[?&]id=\d+/.test(`${url.pathname}${url.search}`);
+    return /\/status\/\d+|\/notes\/[A-Za-z0-9_-]+|\/[A-Za-z0-9]+\/thread\/\d+|\/posts?\/\d+|\/post\/show\/\d+|[?&]id=\d+/.test(`${url.pathname}${url.search}`);
   } catch {
     return false;
   }

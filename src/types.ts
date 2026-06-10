@@ -1,8 +1,10 @@
 export type Rating = "safe" | "questionable" | "explicit";
 
-export type SiteKind = "misskey" | "x" | "booru" | "generic";
+export type SiteKind = "misskey" | "x" | "4chan" | "booru" | "generic";
 
 export type MisskeyArtistMode = "append-domain" | "username-only" | "domain-tag";
+
+export type FourChanTagMode = "none" | "site" | "board" | "site-and-board";
 
 export type SidePanelImageBlurMode = "off" | "hover" | "click";
 
@@ -42,6 +44,7 @@ export type AppSettings = {
   closeAfterImport: boolean;
   clearPanelAfterImportDefault: boolean;
   misskeyArtistMode: MisskeyArtistMode;
+  fourChanTagMode: FourChanTagMode;
   sidePanelImageBlurMode: SidePanelImageBlurMode;
   multiAddCaptureLeftClick: boolean;
   multiAddCaptureRightClick: boolean;
