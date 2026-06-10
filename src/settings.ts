@@ -14,6 +14,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   closeAfterImport: false,
   clearPanelAfterImportDefault: false,
   misskeyArtistMode: "username-only",
+  multiAddCaptureLeftClick: false,
+  multiAddCaptureRightClick: true,
   debugMode: false
 };
 
@@ -43,6 +45,8 @@ export function normalizeSettings(value: Partial<AppSettings> | undefined): AppS
     closeAfterImport: Boolean(legacyValue?.closeAfterImport ?? legacyValue?.closeAfterAiAuto ?? DEFAULT_SETTINGS.closeAfterImport),
     clearPanelAfterImportDefault: Boolean(settings.clearPanelAfterImportDefault),
     misskeyArtistMode: isMisskeyArtistMode(settings.misskeyArtistMode) ? settings.misskeyArtistMode : DEFAULT_SETTINGS.misskeyArtistMode,
+    multiAddCaptureLeftClick: settingBoolean(settings.multiAddCaptureLeftClick, DEFAULT_SETTINGS.multiAddCaptureLeftClick),
+    multiAddCaptureRightClick: settingBoolean(settings.multiAddCaptureRightClick, DEFAULT_SETTINGS.multiAddCaptureRightClick),
     debugMode: Boolean(settings.debugMode)
   };
 }
@@ -59,4 +63,8 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.min(max, Math.max(min, numeric));
+}
+
+function settingBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }

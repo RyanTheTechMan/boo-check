@@ -19,6 +19,9 @@ import {
 } from "./utils/domExtract";
 
 const EXTRACT_PAGE_CONTEXT_MESSAGE = "boo-check:extract-page-context";
+const GET_MULTI_ADD_CAPTURE_STATE_MESSAGE = "boo-check:get-multi-add-capture-state";
+const SET_MULTI_ADD_CAPTURE_MESSAGE = "boo-check:set-multi-add-capture";
+const MULTI_ADD_CAPTURED_DRAFT_MESSAGE = "boo-check:multi-add-captured-draft";
 
 const TWITTER_WEB_BEARER_FALLBACK =
   "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -102,6 +105,13 @@ let lastContextMenuTarget: Element | undefined;
 let lastContextMenuPoint: { clientX: number; clientY: number } | undefined;
 let lastMisskeyMediaContext: MisskeyMediaContext | undefined;
 let twitterApiMetadataPromise: Promise<TwitterApiMetadata | undefined> | undefined;
+let multiAddCaptureEnabled = false;
+let multiAddCaptureLeftClick = false;
+let multiAddCaptureRightClick = true;
+let lastCaptureSignature = "";
+let lastCaptureAt = 0;
+
+void refreshMultiAddCaptureState();
 
 document.addEventListener(
   "contextmenu",
@@ -110,6 +120,10 @@ document.addEventListener(
     lastContextMenuPoint = { clientX: event.clientX, clientY: event.clientY };
     lastContextMenuTarget = resolveContextMenuTarget(event, target);
     rememberMisskeyMediaContext(lastContextMenuTarget);
+    if (shouldCaptureContextMenu(event, lastContextMenuTarget)) {
+      blockPageEvent(event);
+      void captureQueueDraftFromEvent(event, lastContextMenuTarget, "contextmenu");
+    }
   },
   { capture: true }
 );
@@ -117,8 +131,18 @@ document.addEventListener(
 document.addEventListener(
   "pointerdown",
   (event) => {
-    const target = event.target;
-    rememberMisskeyMediaContext(target instanceof Element ? target : target instanceof Node ? target.parentElement ?? undefined : undefined);
+    const target = eventTargetElement(event.target);
+    rememberMisskeyMediaContext(target);
+    if (shouldBlockPointerDown(event, target)) blockPageEvent(event);
+  },
+  { capture: true }
+);
+
+document.addEventListener(
+  "mousedown",
+  (event) => {
+    const target = eventTargetElement(event.target);
+    if (shouldBlockMouseDown(event, target)) blockPageEvent(event);
   },
   { capture: true }
 );
@@ -126,13 +150,23 @@ document.addEventListener(
 document.addEventListener(
   "click",
   (event) => {
-    const target = event.target;
-    rememberMisskeyMediaContext(target instanceof Element ? target : target instanceof Node ? target.parentElement ?? undefined : undefined);
+    const target = eventTargetElement(event.target);
+    rememberMisskeyMediaContext(target);
+    if (shouldCaptureClick(event, target)) {
+      blockPageEvent(event);
+      void captureQueueDraftFromEvent(event, target, "click");
+    }
   },
   { capture: true }
 );
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === SET_MULTI_ADD_CAPTURE_MESSAGE) {
+    applyMultiAddCaptureState(message);
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type !== EXTRACT_PAGE_CONTEXT_MESSAGE) return false;
 
   void handleExtractPageContext(message, sendResponse);
@@ -141,22 +175,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleExtractPageContext(message: { draft?: ImportDraft }, sendResponse: (response?: unknown) => void): Promise<void> {
   try {
-    const messageDraft = applyMisskeyPhotoSwipeMediaToDraft((message.draft ?? {}) as ImportDraft, lastContextMenuTarget);
-    const pendingDraft = attachMisskeyRememberedContext(
-      messageDraft,
-      misskeyContextForExtraction(lastContextMenuTarget)
-    );
-    let draft = extractImportDraft(pendingDraft, lastContextMenuTarget);
-    const asyncDebug = await enrichXVideoFromGraphqlIfNeeded(pendingDraft, draft, lastContextMenuTarget);
-    draft = asyncDebug.draft;
-    if (draft.site === "misskey" && isUsableMisskeyContext(draft)) {
-      rememberMisskeyMediaContext(lastContextMenuTarget);
-    }
-    const debug = buildDebugSnapshot(pendingDraft, draft, lastContextMenuTarget, {
-      mediaCandidates: asyncDebug.mediaCandidates,
-      notes: asyncDebug.notes,
-      errors: asyncDebug.errors
-    });
+    const { draft, debug } = await extractDraftWithDebug((message.draft ?? {}) as ImportDraft, lastContextMenuTarget);
     sendResponse({ ok: true, draft, debug });
   } catch (error) {
     sendResponse({
@@ -164,6 +183,127 @@ async function handleExtractPageContext(message: { draft?: ImportDraft }, sendRe
       error: error instanceof Error ? error.message : "Page extraction failed"
     });
   }
+}
+
+async function refreshMultiAddCaptureState(): Promise<void> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: GET_MULTI_ADD_CAPTURE_STATE_MESSAGE });
+    if (response?.ok) applyMultiAddCaptureState(response);
+  } catch {
+    // Capture starts disabled if the service worker is unavailable.
+  }
+}
+
+function applyMultiAddCaptureState(message: {
+  captureEnabled?: boolean;
+  captureLeftClick?: boolean;
+  captureRightClick?: boolean;
+}): void {
+  multiAddCaptureEnabled = Boolean(message.captureEnabled);
+  multiAddCaptureLeftClick = message.captureLeftClick !== false;
+  multiAddCaptureRightClick = message.captureRightClick !== false;
+}
+
+function shouldCaptureContextMenu(event: MouseEvent, target: Element | undefined): boolean {
+  return multiAddCaptureEnabled && multiAddCaptureRightClick && !isEditableTarget(target);
+}
+
+function shouldCaptureClick(event: MouseEvent, target: Element | undefined): boolean {
+  return multiAddCaptureEnabled && multiAddCaptureLeftClick && event.button === 0 && !isEditableTarget(target);
+}
+
+function shouldBlockPointerDown(event: PointerEvent, target: Element | undefined): boolean {
+  if (!multiAddCaptureEnabled || isEditableTarget(target)) return false;
+  if (event.button === 0) return multiAddCaptureLeftClick;
+  if (event.button === 2) return multiAddCaptureRightClick;
+  return false;
+}
+
+function shouldBlockMouseDown(event: MouseEvent, target: Element | undefined): boolean {
+  if (!multiAddCaptureEnabled || isEditableTarget(target)) return false;
+  if (event.button === 0) return multiAddCaptureLeftClick;
+  if (event.button === 2) return multiAddCaptureRightClick;
+  return false;
+}
+
+function isEditableTarget(target: Element | undefined): boolean {
+  return Boolean(target?.closest("input, textarea, select, option, [contenteditable]"));
+}
+
+function blockPageEvent(event: Event): void {
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+async function captureQueueDraftFromEvent(event: MouseEvent, target: Element | undefined, eventType: "click" | "contextmenu"): Promise<void> {
+  if (isDuplicateCapture(event, target)) return;
+
+  try {
+    const { draft, debug } = await extractDraftWithDebug(baseCaptureDraft(event, target, eventType), target);
+    await chrome.runtime.sendMessage({
+      type: MULTI_ADD_CAPTURED_DRAFT_MESSAGE,
+      draft,
+      debug
+    });
+  } catch {
+    // Keep capture mode quiet on pages where extraction or storage is unavailable.
+  }
+}
+
+function isDuplicateCapture(event: MouseEvent, target: Element | undefined): boolean {
+  const now = Date.now();
+  const signature = [
+    mediaUrlFromElement(target),
+    target?.closest<HTMLAnchorElement>("a[href]")?.href,
+    Math.round(event.clientX),
+    Math.round(event.clientY)
+  ].filter(Boolean).join("|");
+
+  if (signature && signature === lastCaptureSignature && now - lastCaptureAt < 450) return true;
+
+  lastCaptureSignature = signature;
+  lastCaptureAt = now;
+  return false;
+}
+
+function baseCaptureDraft(event: MouseEvent, target: Element | undefined, eventType: "click" | "contextmenu"): ImportDraft {
+  const mediaUrl = mediaUrlFromElement(target);
+  const linkUrl = target?.closest<HTMLAnchorElement>("a[href]")?.href;
+  return {
+    pageUrl: location.href,
+    sourceUrl: linkUrl || location.href,
+    mediaUrl,
+    previewUrl: mediaUrl,
+    site: "generic",
+    raw: {
+      multiAdd: true,
+      eventType,
+      button: event.button,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      linkUrl
+    }
+  };
+}
+
+async function extractDraftWithDebug(inputDraft: ImportDraft, target: Element | undefined): Promise<{ draft: ImportDraft; debug: ImportDebugSnapshot }> {
+  const messageDraft = applyMisskeyPhotoSwipeMediaToDraft(inputDraft, target);
+  const pendingDraft = attachMisskeyRememberedContext(
+    messageDraft,
+    misskeyContextForExtraction(target)
+  );
+  let draft = extractImportDraft(pendingDraft, target);
+  const asyncDebug = await enrichXVideoFromGraphqlIfNeeded(pendingDraft, draft, target);
+  draft = asyncDebug.draft;
+  if (draft.site === "misskey" && isUsableMisskeyContext(draft)) {
+    rememberMisskeyMediaContext(target);
+  }
+  const debug = buildDebugSnapshot(pendingDraft, draft, target, {
+    mediaCandidates: asyncDebug.mediaCandidates,
+    notes: asyncDebug.notes,
+    errors: asyncDebug.errors
+  });
+  return { draft, debug };
 }
 
 function eventTargetElement(target: EventTarget | null): Element | undefined {

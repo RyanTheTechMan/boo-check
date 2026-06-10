@@ -14,6 +14,8 @@ const fields = {
   closeAfterImport: document.getElementById("closeAfterImportSetting") as HTMLInputElement,
   clearPanelAfterImportDefault: document.getElementById("clearPanelAfterImportDefaultSetting") as HTMLInputElement,
   misskeyArtistMode: document.getElementById("misskeyArtistModeSetting") as HTMLSelectElement,
+  multiAddCaptureLeftClick: document.getElementById("multiAddCaptureLeftClickSetting") as HTMLInputElement,
+  multiAddCaptureRightClick: document.getElementById("multiAddCaptureRightClickSetting") as HTMLInputElement,
   debugMode: document.getElementById("debugModeSetting") as HTMLInputElement,
   save: document.getElementById("saveSettingsButton") as HTMLButtonElement,
   saveFeedback: document.getElementById("settingsSaveFeedback") as HTMLSpanElement
@@ -38,6 +40,8 @@ function renderSettings(settings: AppSettings): void {
   fields.closeAfterImport.checked = settings.closeAfterImport;
   fields.clearPanelAfterImportDefault.checked = settings.clearPanelAfterImportDefault;
   fields.misskeyArtistMode.value = settings.misskeyArtistMode;
+  fields.multiAddCaptureLeftClick.checked = settings.multiAddCaptureLeftClick;
+  fields.multiAddCaptureRightClick.checked = settings.multiAddCaptureRightClick;
   fields.debugMode.checked = settings.debugMode;
 }
 
@@ -54,6 +58,8 @@ async function persistSettings(): Promise<void> {
     closeAfterImport: fields.closeAfterImport.checked,
     clearPanelAfterImportDefault: fields.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: fields.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    multiAddCaptureLeftClick: fields.multiAddCaptureLeftClick.checked,
+    multiAddCaptureRightClick: fields.multiAddCaptureRightClick.checked,
     debugMode: fields.debugMode.checked
   });
 

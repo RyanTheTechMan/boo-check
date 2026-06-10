@@ -11,14 +11,28 @@
       <header class="topbar">
         <div>
           <h1>Boo Check</h1>
-          <p id="siteLabel">Ready</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="multiAddToggleButton" type="button">Enable multi-add</button>
+          <button id="clearStateButton" type="button">Clear Side Panel</button>
         </div>
       </header>
 
       <section id="status" class="status" aria-live="polite"></section>
 
-      <section class="utility-actions">
-        <button id="clearStateButton" type="button">Clear Side Panel</button>
+      <section id="queuePanel" class="queue-panel" hidden>
+        <header class="queue-header">
+          <div>
+            <h2>Multi-add queue</h2>
+            <p id="queueSummary">No queued items</p>
+          </div>
+        </header>
+        <div class="queue-actions">
+          <button id="importQueueButton" type="button">Import Queue</button>
+          <button id="importQueueAutoButton" type="button">Import Queue + AI Auto</button>
+          <button id="clearQueueButton" type="button">Clear Queue</button>
+        </div>
+        <div id="queueList" class="queue-list" aria-live="polite"></div>
       </section>
 
       <section class="preview-panel">
@@ -165,6 +179,14 @@
               <option value="append-domain">Append domain to artist</option>
               <option value="domain-tag">Artist name, domain as tag</option>
             </select>
+          </label>
+          <label class="check-row">
+            <input id="multiAddCaptureLeftClickSetting" type="checkbox" />
+            <span>Multi-add captures left-click</span>
+          </label>
+          <label class="check-row">
+            <input id="multiAddCaptureRightClickSetting" type="checkbox" />
+            <span>Multi-add captures right-click</span>
           </label>
           <label class="check-row">
             <input id="debugModeSetting" type="checkbox" />

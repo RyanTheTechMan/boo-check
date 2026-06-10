@@ -40,6 +40,8 @@ export type AppSettings = {
   closeAfterImport: boolean;
   clearPanelAfterImportDefault: boolean;
   misskeyArtistMode: MisskeyArtistMode;
+  multiAddCaptureLeftClick: boolean;
+  multiAddCaptureRightClick: boolean;
   debugMode: boolean;
 };
 
@@ -60,6 +62,68 @@ export type PendingImport = {
   tabId?: number;
   createdAt: number;
 };
+
+export type ImportFormState = {
+  source: string;
+  artist: string;
+  rating: Rating;
+  tags: string;
+  includePostHashtags?: boolean;
+};
+
+export type ManualImportState = {
+  mediaId: string;
+  link?: string;
+  predictions: AiTagPrediction[];
+  baseTags?: string[];
+  appliedNames?: string[];
+  selectedNames: string[];
+};
+
+export type UploadedImportState = {
+  mediaId?: string;
+  link?: string;
+  finalSaved?: boolean;
+};
+
+export type ImportMediaMetadata = {
+  url: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
+  mimeType?: string;
+  sizeSource?: "head" | "blob";
+  loading?: boolean;
+  error?: string;
+};
+
+export type ImportQueueItemStatus = "queued" | "importing" | "imported" | "duplicate" | "error";
+
+export type ImportQueueItem = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  draft: ImportDraft;
+  form?: ImportFormState;
+  debug?: ImportDebugSnapshot;
+  mediaMetadata?: ImportMediaMetadata;
+  manual?: ManualImportState;
+  uploaded?: UploadedImportState;
+  status: ImportQueueItemStatus;
+  statusMessage?: string;
+  statusLink?: string;
+  error?: string;
+};
+
+export type ImportQueueState = {
+  tabId: number;
+  captureEnabled: boolean;
+  selectedItemId?: string;
+  items: ImportQueueItem[];
+  updatedAt: number;
+};
+
+export type ImportQueueStore = Record<string, ImportQueueState>;
 
 export type DebugElementSummary = {
   tagName: string;
@@ -137,26 +201,9 @@ export type SavedSidePanelState = {
   tabId?: number;
   pendingCreatedAt?: number;
   draft: ImportDraft;
-  form: {
-    source: string;
-    artist: string;
-    rating: Rating;
-    tags: string;
-    includePostHashtags?: boolean;
-  };
-  manual?: {
-    mediaId: string;
-    link?: string;
-    predictions: AiTagPrediction[];
-    baseTags?: string[];
-    appliedNames?: string[];
-    selectedNames: string[];
-  };
-  uploaded?: {
-    mediaId?: string;
-    link?: string;
-    finalSaved?: boolean;
-  };
+  form: ImportFormState;
+  manual?: ManualImportState;
+  uploaded?: UploadedImportState;
   status?: {
     message: string;
     tone: "info" | "success" | "error";

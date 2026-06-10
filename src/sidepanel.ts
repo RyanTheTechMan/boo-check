@@ -5,13 +5,24 @@ import {
   BlombooruDuplicateError,
   type UploadMediaResult
 } from "./api/blombooru";
-import { EXTRACT_PAGE_CONTEXT_MESSAGE, PENDING_IMPORT_KEY, SIDE_PANEL_STATE_KEY } from "./constants";
+import {
+  EXTRACT_PAGE_CONTEXT_MESSAGE,
+  IMPORT_QUEUE_STORE_KEY,
+  PENDING_IMPORT_KEY,
+  SET_MULTI_ADD_CAPTURE_MESSAGE,
+  SIDE_PANEL_STATE_KEY
+} from "./constants";
 import { DEFAULT_SETTINGS, loadSettings, normalizeSettings, saveSettings } from "./settings";
 import type {
   AiTagPrediction,
   AppSettings,
   ImportDebugSnapshot,
   ImportDraft,
+  ImportFormState,
+  ImportMediaMetadata,
+  ImportQueueItem,
+  ImportQueueState,
+  ImportQueueStore,
   PendingImport,
   Rating,
   SavedSidePanelState,
@@ -47,21 +58,18 @@ type UploadedState = {
   finalSaved?: boolean;
 };
 
-type MediaMetadata = {
-  url: string;
-  width?: number;
-  height?: number;
-  bytes?: number;
-  mimeType?: string;
-  sizeSource?: "head" | "blob";
-  loading?: boolean;
-  error?: string;
-};
+type MediaMetadata = ImportMediaMetadata;
 
 const els = {
-  siteLabel: byId<HTMLParagraphElement>("siteLabel"),
   status: byId<HTMLDivElement>("status"),
   clearState: byId<HTMLButtonElement>("clearStateButton"),
+  queuePanel: byId<HTMLElement>("queuePanel"),
+  queueSummary: byId<HTMLParagraphElement>("queueSummary"),
+  multiAddToggle: byId<HTMLButtonElement>("multiAddToggleButton"),
+  importQueue: byId<HTMLButtonElement>("importQueueButton"),
+  importQueueAuto: byId<HTMLButtonElement>("importQueueAutoButton"),
+  clearQueue: byId<HTMLButtonElement>("clearQueueButton"),
+  queueList: byId<HTMLDivElement>("queueList"),
   preview: byId<HTMLDivElement>("preview"),
   mediaMetadata: byId<HTMLDivElement>("mediaMetadata"),
   source: byId<HTMLInputElement>("sourceInput"),
@@ -93,6 +101,8 @@ const els = {
   closeAfterImport: byId<HTMLInputElement>("closeAfterImportSetting"),
   clearPanelAfterImportDefault: byId<HTMLInputElement>("clearPanelAfterImportDefaultSetting"),
   misskeyArtistMode: byId<HTMLSelectElement>("misskeyArtistModeSetting"),
+  multiAddCaptureLeftClick: byId<HTMLInputElement>("multiAddCaptureLeftClickSetting"),
+  multiAddCaptureRightClick: byId<HTMLInputElement>("multiAddCaptureRightClickSetting"),
   saveSettings: byId<HTMLButtonElement>("saveSettingsButton"),
   settingsSaveFeedback: byId<HTMLSpanElement>("settingsSaveFeedback"),
   successPopup: byId<HTMLElement>("successPopup"),
@@ -128,12 +138,15 @@ let artistStatusRequest = 0;
 let closeCountdownTimer: number | undefined;
 let settingsFeedbackTimer: number | undefined;
 let stateSaveTimer: number | undefined;
+let queueSaveTimer: number | undefined;
 let pendingCreatedAt = 0;
 let latestDebugSnapshot: ImportDebugSnapshot | undefined;
 let currentStatusState: SavedSidePanelState["status"] | undefined;
 let currentSuccessState: SavedSidePanelState["success"] | undefined;
 let mediaMetadata: MediaMetadata | undefined;
 let mediaMetadataRequest = 0;
+let currentQueue: ImportQueueState | undefined;
+let selectedQueueItemId: string | undefined;
 
 const autocompleteCache = new Map<string, TagSuggestion[]>();
 const artistAutocompleteCache = new Map<string, TagSuggestion[]>();
@@ -147,13 +160,17 @@ async function init(): Promise<void> {
   renderSettings(settings);
   els.includeHashtags.checked = settings.includePostHashtagsDefault;
   const restored = await restoreInitialState();
+  await loadQueueForCurrentTab();
+  const restoredQueueItem = await restoreSelectedQueueItemFromQueue();
 
-  if (!restored) {
+  if (!restored && !restoredQueueItem) {
     applyDraftToForm();
     renderAll();
     await enrichFromActiveTab();
     applyDraftToForm({ preserveEditedTags: true });
     renderAll();
+  } else {
+    renderQueue();
   }
 
   if (!settings.baseUrl || !settings.apiKey) {
@@ -168,6 +185,10 @@ async function init(): Promise<void> {
 function bindEvents(): void {
   els.saveSettings.addEventListener("click", () => void persistSettings());
   els.clearState.addEventListener("click", () => void clearSidePanelState());
+  els.multiAddToggle.addEventListener("click", () => void toggleMultiAddCapture());
+  els.importQueue.addEventListener("click", () => void importQueueNoAi());
+  els.importQueueAuto.addEventListener("click", () => void importQueueAiAuto());
+  els.clearQueue.addEventListener("click", () => void clearQueue());
   els.import.addEventListener("click", () => void importNoAi());
   els.importAuto.addEventListener("click", () => void importAiAuto());
   els.importManual.addEventListener("click", () => void importAiManual());
@@ -206,29 +227,39 @@ function bindEvents(): void {
     if (event.key === "Escape" && !els.successPopup.hidden) void dismissSuccessPopup();
   });
   window.addEventListener("pagehide", () => {
+    void persistSelectedQueueItemEditsNow();
     void persistSidePanelStateNow();
   });
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "session" || !changes[PENDING_IMPORT_KEY]) return;
-    const nextPending = changes[PENDING_IMPORT_KEY].newValue as PendingImport | undefined;
-    if (!nextPending?.draft) return;
-    const isNewPending = nextPending.createdAt !== pendingCreatedAt || nextPending.tabId !== pendingTabId;
-    draft = nextPending.draft;
-    pendingTabId = nextPending.tabId;
-    pendingCreatedAt = nextPending.createdAt;
-    if (isNewPending) els.includeHashtags.checked = settings.includePostHashtagsDefault;
-    manualState = undefined;
-    uploadedState = undefined;
-    els.manualPanel.classList.add("hidden");
-    renderWorkflowState();
-    hideSuccessPopup();
-    void enrichFromActiveTab().then(() => {
-      applyDraftToForm();
-      renderAll();
-      renderDebugPanel();
-      setStatus("Loaded new context-menu draft.", "info");
-      persistSidePanelStateDebounced();
-    });
+    if (areaName !== "session") return;
+
+    if (changes[IMPORT_QUEUE_STORE_KEY]) {
+      void handleQueueStoreChanged(changes[IMPORT_QUEUE_STORE_KEY].newValue as ImportQueueStore | undefined);
+    }
+
+    if (changes[PENDING_IMPORT_KEY]) {
+      const nextPending = changes[PENDING_IMPORT_KEY].newValue as PendingImport | undefined;
+      if (!nextPending?.draft) return;
+      const isNewPending = nextPending.createdAt !== pendingCreatedAt || nextPending.tabId !== pendingTabId;
+      selectedQueueItemId = undefined;
+      draft = nextPending.draft;
+      pendingTabId = nextPending.tabId;
+      pendingCreatedAt = nextPending.createdAt;
+      if (isNewPending) els.includeHashtags.checked = settings.includePostHashtagsDefault;
+      manualState = undefined;
+      uploadedState = undefined;
+      els.manualPanel.classList.add("hidden");
+      renderWorkflowState();
+      renderQueue();
+      hideSuccessPopup();
+      void enrichFromActiveTab().then(() => {
+        applyDraftToForm();
+        renderAll();
+        renderDebugPanel();
+        setStatus("Loaded new context-menu draft.", "info");
+        persistSidePanelStateDebounced();
+      });
+    }
   });
   document.addEventListener("click", (event) => {
     if (!els.autocomplete.contains(event.target as Node) && event.target !== els.tags) hideAutocomplete();
@@ -347,6 +378,7 @@ function buildSavedSidePanelState(): SavedSidePanelState {
 }
 
 function persistSidePanelStateDebounced(): void {
+  persistSelectedQueueItemEditsDebounced();
   if (stateSaveTimer) window.clearTimeout(stateSaveTimer);
   stateSaveTimer = window.setTimeout(() => void persistSidePanelStateNow(), 180);
 }
@@ -365,9 +397,18 @@ async function clearSidePanelState(options: { showStatus?: boolean } = {}): Prom
     window.clearTimeout(stateSaveTimer);
     stateSaveTimer = undefined;
   }
+  if (queueSaveTimer) {
+    window.clearTimeout(queueSaveTimer);
+    queueSaveTimer = undefined;
+  }
 
   clearCloseCountdown();
   await chrome.storage.session.remove(PENDING_IMPORT_KEY);
+  selectedQueueItemId = undefined;
+  if (currentQueue) {
+    currentQueue = { ...currentQueue, selectedItemId: undefined, updatedAt: Date.now() };
+    await persistQueueStateNow({ preserveExternalItems: true });
+  }
 
   draft = {};
   pendingTabId = undefined;
@@ -388,6 +429,7 @@ async function clearSidePanelState(options: { showStatus?: boolean } = {}): Prom
   els.manualPanel.classList.add("hidden");
   els.manualList.replaceChildren();
   renderWorkflowState();
+  renderQueue();
   hideSuccessPopup({ persist: false });
   clearRenderedStatus();
   renderAll();
@@ -422,6 +464,591 @@ async function currentTabId(): Promise<number | undefined> {
   return tab?.id;
 }
 
+async function loadQueueForCurrentTab(): Promise<void> {
+  const tabId = pendingTabId ?? (await currentTabId());
+  if (typeof tabId !== "number") {
+    currentQueue = undefined;
+    selectedQueueItemId = undefined;
+    renderQueue();
+    return;
+  }
+
+  currentQueue = await readQueueState(tabId);
+  renderQueue();
+}
+
+async function restoreSelectedQueueItemFromQueue(): Promise<boolean> {
+  if (!currentQueue?.items.length || pendingCreatedAt) return false;
+  const item = queueItemById(currentQueue.selectedItemId) ?? currentQueue.items[0];
+  if (!item) return false;
+  await loadQueueItem(item.id, { skipSave: true, quiet: true });
+  return true;
+}
+
+async function handleQueueStoreChanged(store: ImportQueueStore | undefined): Promise<void> {
+  const tabId = currentQueue?.tabId ?? pendingTabId ?? (await currentTabId());
+  if (typeof tabId !== "number") return;
+
+  const previousHadItems = Boolean(currentQueue?.items.length);
+  currentQueue = normalizeQueueState(tabId, store?.[String(tabId)]);
+  const selectedStillExists = selectedQueueItemId ? Boolean(queueItemById(selectedQueueItemId)) : false;
+  if (selectedQueueItemId && !selectedStillExists) selectedQueueItemId = undefined;
+
+  if (!selectedQueueItemId && !pendingCreatedAt && !hasActiveImportView() && currentQueue.selectedItemId) {
+    await loadQueueItem(currentQueue.selectedItemId, { skipSave: true, quiet: true, updateStore: false });
+    return;
+  }
+
+  if (!previousHadItems && currentQueue.items.length && !selectedQueueItemId && !pendingCreatedAt && currentQueue.selectedItemId) {
+    await loadQueueItem(currentQueue.selectedItemId, { skipSave: true, quiet: true, updateStore: false });
+    return;
+  }
+
+  renderQueue();
+}
+
+function hasActiveImportView(): boolean {
+  return Boolean(draft.mediaUrl || draft.previewUrl || els.source.value || els.artist.value || els.tags.value);
+}
+
+async function readQueueStore(): Promise<ImportQueueStore> {
+  const result = await chrome.storage.session.get(IMPORT_QUEUE_STORE_KEY);
+  return (result[IMPORT_QUEUE_STORE_KEY] ?? {}) as ImportQueueStore;
+}
+
+async function writeQueueStore(store: ImportQueueStore): Promise<void> {
+  await chrome.storage.session.set({ [IMPORT_QUEUE_STORE_KEY]: store });
+}
+
+async function readQueueState(tabId: number): Promise<ImportQueueState> {
+  const store = await readQueueStore();
+  return normalizeQueueState(tabId, store[String(tabId)]);
+}
+
+function normalizeQueueState(tabId: number, state: ImportQueueState | undefined): ImportQueueState {
+  return {
+    tabId,
+    captureEnabled: Boolean(state?.captureEnabled),
+    selectedItemId: state?.selectedItemId,
+    items: Array.isArray(state?.items) ? state.items : [],
+    updatedAt: state?.updatedAt ?? Date.now()
+  };
+}
+
+async function persistQueueStateNow(options: { preserveExternalItems?: boolean } = {}): Promise<void> {
+  if (!currentQueue) return;
+  const store = await readQueueStore();
+  if (options.preserveExternalItems) {
+    const latest = normalizeQueueState(currentQueue.tabId, store[String(currentQueue.tabId)]);
+    const currentIds = new Set(currentQueue.items.map((item) => item.id));
+    const externalItems = latest.items.filter((item) => !currentIds.has(item.id));
+    if (externalItems.length) {
+      currentQueue = {
+        ...currentQueue,
+        items: [...currentQueue.items, ...externalItems],
+        updatedAt: Date.now()
+      };
+    }
+  }
+  await writeQueueStore({
+    ...store,
+    [String(currentQueue.tabId)]: currentQueue
+  });
+}
+
+async function updateCurrentQueue(update: (queue: ImportQueueState) => ImportQueueState): Promise<void> {
+  if (!currentQueue) await loadQueueForCurrentTab();
+  if (!currentQueue) return;
+  currentQueue = update(currentQueue);
+  await persistQueueStateNow({ preserveExternalItems: true });
+  renderQueue();
+}
+
+function queueItemById(itemId: string | undefined): ImportQueueItem | undefined {
+  if (!itemId) return undefined;
+  return currentQueue?.items.find((item) => item.id === itemId);
+}
+
+function persistSelectedQueueItemEditsDebounced(): void {
+  if (!selectedQueueItemId || !currentQueue) return;
+  if (queueSaveTimer) window.clearTimeout(queueSaveTimer);
+  queueSaveTimer = window.setTimeout(() => void persistSelectedQueueItemEditsNow(), 180);
+}
+
+async function persistSelectedQueueItemEditsNow(): Promise<void> {
+  if (queueSaveTimer) {
+    window.clearTimeout(queueSaveTimer);
+    queueSaveTimer = undefined;
+  }
+  if (!selectedQueueItemId || !currentQueue || !queueItemById(selectedQueueItemId)) return;
+
+  const now = Date.now();
+  const manual = manualState
+    ? {
+        mediaId: manualState.mediaId,
+        link: manualState.link,
+        predictions: manualState.predictions,
+        baseTags: manualState.baseTags,
+        appliedNames: manualState.appliedNames,
+        selectedNames: selectedManualPredictionNames()
+      }
+    : undefined;
+
+  currentQueue = {
+    ...currentQueue,
+    selectedItemId: selectedQueueItemId,
+    items: currentQueue.items.map((item) =>
+      item.id === selectedQueueItemId
+        ? {
+            ...item,
+            draft,
+            form: currentFormState(),
+            debug: latestDebugSnapshot,
+            mediaMetadata,
+            manual,
+            uploaded: uploadedState,
+            updatedAt: now
+          }
+        : item
+    ),
+    updatedAt: now
+  };
+  await persistQueueStateNow({ preserveExternalItems: true });
+  renderQueue();
+}
+
+async function loadQueueItem(
+  itemId: string,
+  options: { skipSave?: boolean; quiet?: boolean; updateStore?: boolean } = {}
+): Promise<void> {
+  const item = queueItemById(itemId);
+  if (!item || !currentQueue) return;
+
+  if (!options.skipSave) await persistSelectedQueueItemEditsNow();
+
+  selectedQueueItemId = item.id;
+  currentQueue = {
+    ...currentQueue,
+    selectedItemId: item.id,
+    updatedAt: Date.now()
+  };
+  if (options.updateStore ?? true) await persistQueueStateNow({ preserveExternalItems: true });
+
+  draft = item.draft;
+  pendingTabId = currentQueue.tabId;
+  pendingCreatedAt = 0;
+  latestDebugSnapshot = item.debug;
+  uploadedState = item.uploaded;
+  mediaMetadata = item.mediaMetadata;
+  mediaMetadataRequest += 1;
+  applyFormState(item.form ?? defaultFormForDraft(item.draft));
+
+  if (item.manual) {
+    manualState = {
+      mediaId: item.manual.mediaId,
+      link: item.manual.link,
+      predictions: item.manual.predictions,
+      baseTags: item.manual.baseTags ?? [],
+      appliedNames: item.manual.appliedNames ?? item.manual.selectedNames ?? []
+    };
+    renderManualPredictions(item.manual.predictions, item.manual.selectedNames);
+  } else {
+    manualState = undefined;
+    els.manualPanel.classList.add("hidden");
+    els.manualList.replaceChildren();
+  }
+
+  hideSuccessPopup({ persist: false });
+  if (item.statusMessage) {
+    renderStatus({
+      message: item.statusMessage,
+      tone: queueStatusTone(item.status),
+      link: item.statusLink
+    });
+  } else if (!options.quiet) {
+    clearRenderedStatus();
+  }
+
+  renderAll();
+  renderQueue();
+  renderDebugPanel();
+  persistSidePanelStateDebounced();
+}
+
+function queueStatusTone(status: ImportQueueItem["status"]): StatusTone {
+  return status === "error" ? "error" : status === "queued" || status === "importing" ? "info" : "success";
+}
+
+async function removeQueueItem(itemId: string): Promise<void> {
+  if (!currentQueue) return;
+  const wasSelected = selectedQueueItemId === itemId;
+  const remaining = currentQueue.items.filter((item) => item.id !== itemId);
+  const nextSelected = wasSelected ? remaining[0]?.id : currentQueue.selectedItemId;
+  currentQueue = {
+    ...currentQueue,
+    selectedItemId: nextSelected,
+    items: remaining,
+    updatedAt: Date.now()
+  };
+  selectedQueueItemId = wasSelected ? undefined : selectedQueueItemId;
+  await persistQueueStateNow();
+
+  if (wasSelected && nextSelected) {
+    await loadQueueItem(nextSelected, { skipSave: true, quiet: true });
+  } else if (wasSelected) {
+    resetImportView();
+  }
+
+  renderQueue();
+}
+
+async function clearQueue(): Promise<void> {
+  if (!currentQueue) return;
+  selectedQueueItemId = undefined;
+  currentQueue = {
+    ...currentQueue,
+    selectedItemId: undefined,
+    items: [],
+    updatedAt: Date.now()
+  };
+  await persistQueueStateNow();
+  resetImportView();
+  renderQueue();
+  setStatus("Queue cleared.", "success");
+}
+
+function resetImportView(): void {
+  draft = {};
+  pendingCreatedAt = 0;
+  manualState = undefined;
+  uploadedState = undefined;
+  latestDebugSnapshot = undefined;
+  mediaMetadata = undefined;
+  applyFormState({
+    source: "",
+    artist: "",
+    rating: settings.defaultRating,
+    tags: "",
+    includePostHashtags: settings.includePostHashtagsDefault
+  });
+  els.manualPanel.classList.add("hidden");
+  els.manualList.replaceChildren();
+  hideSuccessPopup({ persist: false });
+  clearRenderedStatus();
+  renderAll();
+}
+
+async function toggleMultiAddCapture(): Promise<void> {
+  if (!currentQueue) await loadQueueForCurrentTab();
+  if (!currentQueue) {
+    setStatus("No active tab available for multi-add capture.", "error");
+    return;
+  }
+
+  await setMultiAddCapture(!currentQueue.captureEnabled);
+}
+
+async function setMultiAddCapture(captureEnabled: boolean): Promise<void> {
+  if (!currentQueue) return;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: SET_MULTI_ADD_CAPTURE_MESSAGE,
+      tabId: currentQueue.tabId,
+      captureEnabled
+    });
+    if (response?.ok && response.queue) {
+      currentQueue = response.queue as ImportQueueState;
+    } else {
+      currentQueue = { ...currentQueue, captureEnabled, updatedAt: Date.now() };
+      await persistQueueStateNow();
+    }
+    renderQueue();
+    setStatus(captureEnabled ? "Multi-add capture enabled for this tab." : "Multi-add capture disabled.", "info");
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "Could not update multi-add capture.", "error");
+  }
+}
+
+async function syncCaptureStateToActiveTab(): Promise<void> {
+  if (!currentQueue?.captureEnabled) return;
+  await setMultiAddCapture(true);
+}
+
+function renderQueue(): void {
+  const queue = currentQueue;
+  const items = queue?.items ?? [];
+  const captureEnabled = Boolean(queue?.captureEnabled);
+  els.queuePanel.hidden = !captureEnabled && !items.length;
+  els.multiAddToggle.textContent = captureEnabled ? "Disable multi-add" : "Enable multi-add";
+  els.multiAddToggle.dataset.active = String(captureEnabled);
+  els.queueSummary.textContent = queueSummaryText(items.length, captureEnabled);
+  els.importQueue.disabled = busy || !items.length;
+  els.importQueueAuto.disabled = busy || !items.length;
+  els.clearQueue.disabled = busy || !items.length;
+  els.queueList.replaceChildren();
+
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "queue-empty";
+    empty.textContent = captureEnabled ? "Click posts or images on the page to add them here." : "Enable multi-add to collect posts from the active tab.";
+    els.queueList.append(empty);
+    return;
+  }
+
+  for (const item of items) {
+    els.queueList.append(queueRow(item));
+  }
+}
+
+function queueSummaryText(count: number, captureEnabled: boolean): string {
+  const itemText = `${count} queued item${count === 1 ? "" : "s"}`;
+  return captureEnabled ? `${itemText} - capture is on` : itemText;
+}
+
+function queueRow(item: ImportQueueItem): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "queue-row";
+  row.dataset.selected = String(item.id === selectedQueueItemId);
+
+  const select = document.createElement("button");
+  select.type = "button";
+  select.className = "queue-select";
+  select.addEventListener("click", () => void loadQueueItem(item.id));
+
+  const thumb = queueThumb(item);
+  const body = document.createElement("span");
+  body.className = "queue-body";
+
+  const title = document.createElement("span");
+  title.className = "queue-title";
+  title.textContent = queueItemTitle(item);
+
+  const meta = document.createElement("span");
+  meta.className = "queue-meta";
+  meta.textContent = queueItemMeta(item);
+
+  const badge = document.createElement("span");
+  badge.className = "queue-badge";
+  badge.dataset.status = item.status;
+  badge.textContent = item.status;
+
+  body.append(title, meta);
+  select.append(thumb, body, badge);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "queue-remove";
+  remove.setAttribute("aria-label", "Remove queued item");
+  remove.textContent = "x";
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void removeQueueItem(item.id);
+  });
+
+  row.append(select, remove);
+  return row;
+}
+
+function queueThumb(item: ImportQueueItem): HTMLElement {
+  const url = item.draft.previewUrl || item.draft.mediaUrl;
+  const thumb = document.createElement("span");
+  thumb.className = "queue-thumb";
+
+  if (!url) {
+    thumb.textContent = "?";
+    return thumb;
+  }
+
+  if (isVideoUrl(url)) {
+    thumb.textContent = "Video";
+    return thumb;
+  }
+
+  const image = document.createElement("img");
+  image.src = url;
+  image.alt = "";
+  thumb.append(image);
+  return thumb;
+}
+
+function queueItemTitle(item: ImportQueueItem): string {
+  const source = item.form?.source || item.draft.sourceUrl || item.draft.pageUrl || item.draft.mediaUrl || "Queued item";
+  try {
+    const url = new URL(source);
+    return url.hostname.replace(/^www\./, "") || source;
+  } catch {
+    return source;
+  }
+}
+
+function queueItemMeta(item: ImportQueueItem): string {
+  const tags = item.form?.tags ? parseTagsWithHints(item.form.tags).tags.length : 0;
+  const dimensions = item.mediaMetadata?.width && item.mediaMetadata.height
+    ? `${item.mediaMetadata.width} x ${item.mediaMetadata.height}`
+    : undefined;
+  return [item.draft.site ?? "generic", dimensions, tags ? `${tags} tags` : undefined, item.statusMessage].filter(Boolean).join(" - ");
+}
+
+async function importQueueNoAi(): Promise<void> {
+  await importQueueItems({ aiAuto: false });
+}
+
+async function importQueueAiAuto(): Promise<void> {
+  await importQueueItems({ aiAuto: true });
+}
+
+async function importQueueItems(options: { aiAuto: boolean }): Promise<void> {
+  if (!currentQueue?.items.length) {
+    setStatus("Queue is empty.", "info");
+    return;
+  }
+
+  await persistSelectedQueueItemEditsNow();
+
+  await runImport(async () => {
+    const api = requireConfiguredApi();
+    const targets = (currentQueue?.items ?? []).filter(isQueueItemImportable);
+    if (!targets.length) {
+      setStatus("No queued items need importing.", "info");
+      return;
+    }
+
+    let imported = 0;
+    let duplicates = 0;
+    let failed = 0;
+
+    for (const target of targets) {
+      if (!queueItemById(target.id)) continue;
+      await loadQueueItem(target.id, { quiet: true });
+      await setQueueItemStatus(target.id, "importing", options.aiAuto ? "Importing with AI auto..." : "Importing...");
+
+      try {
+        if (options.aiAuto) {
+          await importCurrentQueueItemAiAuto(api);
+        } else {
+          await importCurrentQueueItemNoAi(api);
+        }
+        imported += 1;
+      } catch (error) {
+        if (error instanceof BlombooruDuplicateError) {
+          duplicates += 1;
+          markUploaded(error.result ?? { raw: undefined }, { finalSaved: true });
+          await persistSelectedQueueItemEditsNow();
+          await setQueueItemStatus(target.id, "duplicate", "Already imported.", error.result?.link);
+          continue;
+        }
+
+        failed += 1;
+        await persistSelectedQueueItemEditsNow();
+        await setQueueItemStatus(target.id, "error", queueImportErrorMessage(error), undefined, queueImportErrorMessage(error));
+      }
+    }
+
+    const parts = [
+      `${imported} imported`,
+      duplicates ? `${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : undefined,
+      failed ? `${failed} failed` : undefined
+    ].filter(Boolean);
+    setStatus(`Queue finished: ${parts.join(", ")}.`, failed ? "error" : "success");
+  });
+}
+
+function isQueueItemImportable(item: ImportQueueItem): boolean {
+  return item.status !== "imported" && item.status !== "duplicate" && item.status !== "importing";
+}
+
+async function importCurrentQueueItemNoAi(api: BlombooruApi): Promise<void> {
+  const payload = buildFinalPayload();
+  const upload = await uploadCurrentMedia(api, payload);
+  markUploaded(upload, { finalSaved: true });
+  await persistSelectedQueueItemEditsNow();
+  await setQueueItemStatus(requireSelectedQueueItemId(), "imported", "Imported.", upload.link);
+}
+
+async function importCurrentQueueItemAiAuto(api: BlombooruApi): Promise<void> {
+  const initialPayload = buildFinalPayload();
+  const upload = await uploadCurrentMedia(api, initialPayload);
+  const mediaId = requireMediaId(upload);
+  markUploaded(upload);
+
+  let predictions: AiTagPrediction[];
+  try {
+    predictions = (await api.predict(mediaId)).map(normalizePrediction).filter((item): item is AiTagPrediction => Boolean(item));
+  } catch {
+    await persistSelectedQueueItemEditsNow();
+    throw new Error("Imported, but AI tagging failed.");
+  }
+
+  const selected = selectAutoPredictions(predictions);
+  rememberPredictionCategories(selected);
+  const nextTags = mergeTags(nonRatingTags(parseTagsWithHints(els.tags.value).tags), selected.map((tag) => tag.name));
+  els.tags.value = tagText(nextTags);
+  renderChips();
+
+  const finalPayload = buildFinalPayload(selected);
+  try {
+    await api.ensureTagsWithCategories(finalPayload.categoryHints);
+    const patched = await api.patchMedia(mediaId, {
+      tags: finalPayload.tags,
+      rating: finalPayload.rating,
+      source: finalPayload.source,
+      categoryHints: finalPayload.categoryHints
+    });
+    manualState = undefined;
+    markUploaded(patched.link ? patched : upload, { mediaId, finalSaved: true });
+    renderWorkflowState();
+    await persistSelectedQueueItemEditsNow();
+    await setQueueItemStatus(requireSelectedQueueItemId(), "imported", `Imported with ${selected.length} AI tags.`, patched.link || upload.link);
+  } catch {
+    await persistSelectedQueueItemEditsNow();
+    throw new Error("Imported and AI predicted, but saving final tags failed.");
+  }
+}
+
+function requireSelectedQueueItemId(): string {
+  if (!selectedQueueItemId) throw new Error("No selected queue item.");
+  return selectedQueueItemId;
+}
+
+async function setQueueItemStatus(
+  itemId: string,
+  status: ImportQueueItem["status"],
+  message: string,
+  link?: string,
+  error?: string
+): Promise<void> {
+  await updateCurrentQueue((queue) => ({
+    ...queue,
+    items: queue.items.map((item) =>
+      item.id === itemId
+        ? {
+            ...item,
+            status,
+            statusMessage: message,
+            statusLink: link,
+            error,
+            updatedAt: Date.now()
+          }
+        : item
+    ),
+    updatedAt: Date.now()
+  }));
+
+  if (itemId === selectedQueueItemId) {
+    renderStatus({
+      message,
+      tone: queueStatusTone(status),
+      link
+    });
+  }
+}
+
+function queueImportErrorMessage(error: unknown): string {
+  if (error instanceof BlombooruAuthError) return "Blombooru rejected the API key.";
+  if (error instanceof BlombooruApiError) return error.message;
+  return error instanceof Error ? error.message : "Import failed.";
+}
+
 function mergeDrafts(base: ImportDraft, extracted: ImportDraft): ImportDraft {
   return {
     ...base,
@@ -437,14 +1064,13 @@ function definedOnly(value: ImportDraft): ImportDraft {
 }
 
 function applyDraftToForm(options: { preserveEditedTags?: boolean } = {}): void {
-  const rating = draft.rating ?? settings.defaultRating;
-  const misskeyArtist = misskeyArtistFormValues(draft);
-  els.source.value = draft.sourceUrl || draft.pageUrl || "";
-  els.artist.value = misskeyArtist.artist || draft.artistTag || "";
-  els.rating.value = rating;
+  const form = defaultFormForDraft(draft, els.includeHashtags.checked);
+  els.source.value = form.source;
+  els.artist.value = form.artist;
+  els.rating.value = form.rating;
 
   if (!options.preserveEditedTags || !els.tags.value.trim()) {
-    els.tags.value = tagText(nonRatingTags(defaultTagListForDraft(misskeyArtist.domainTag)));
+    els.tags.value = form.tags;
   } else {
     syncHashtagTagsWithToggle();
   }
@@ -452,17 +1078,47 @@ function applyDraftToForm(options: { preserveEditedTags?: boolean } = {}): void 
   persistSidePanelStateDebounced();
 }
 
-function defaultTagListForDraft(domainTag: string | undefined): string[] {
-  return mergeTags(nonHashtagSeedTags(), els.includeHashtags.checked ? draft.hashtags : undefined, domainTag ? [domainTag] : []);
+function defaultFormForDraft(nextDraft: ImportDraft, includeHashtags = settings.includePostHashtagsDefault): ImportFormState {
+  const misskeyArtist = misskeyArtistFormValues(nextDraft);
+  return {
+    source: nextDraft.sourceUrl || nextDraft.pageUrl || "",
+    artist: misskeyArtist.artist || nextDraft.artistTag || "",
+    rating: nextDraft.rating ?? settings.defaultRating,
+    tags: tagText(nonRatingTags(defaultTagListForDraft(nextDraft, includeHashtags, misskeyArtist.domainTag))),
+    includePostHashtags: includeHashtags
+  };
 }
 
-function nonHashtagSeedTags(): string[] {
-  const hashtags = new Set(normalizedDraftHashtags());
-  return (draft.seedTags ?? []).filter((tag) => !hashtags.has(normalizeTag(tag)));
+function currentFormState(): ImportFormState {
+  return {
+    source: els.source.value,
+    artist: els.artist.value,
+    rating: els.rating.value as Rating,
+    tags: els.tags.value,
+    includePostHashtags: els.includeHashtags.checked
+  };
 }
 
-function normalizedDraftHashtags(): string[] {
-  return mergeTags(draft.hashtags).map(normalizeTag).filter(Boolean);
+function applyFormState(form: ImportFormState): void {
+  els.source.value = form.source;
+  els.artist.value = form.artist;
+  els.rating.value = form.rating;
+  els.tags.value = form.tags;
+  els.includeHashtags.checked = form.includePostHashtags ?? settings.includePostHashtagsDefault;
+  scheduleArtistStatus();
+}
+
+function defaultTagListForDraft(nextDraft: ImportDraft, includeHashtags: boolean, domainTag: string | undefined): string[] {
+  return mergeTags(nonHashtagSeedTags(nextDraft), includeHashtags ? nextDraft.hashtags : undefined, domainTag ? [domainTag] : []);
+}
+
+function nonHashtagSeedTags(nextDraft = draft): string[] {
+  const hashtags = new Set(normalizedDraftHashtags(nextDraft));
+  return (nextDraft.seedTags ?? []).filter((tag) => !hashtags.has(normalizeTag(tag)));
+}
+
+function normalizedDraftHashtags(nextDraft = draft): string[] {
+  return mergeTags(nextDraft.hashtags).map(normalizeTag).filter(Boolean);
 }
 
 function syncHashtagTagsWithToggle(): void {
@@ -518,7 +1174,6 @@ function normalizeMisskeyDomainTag(domain: string | undefined): string | undefin
 function renderAll(): void {
   renderPreview();
   renderChips();
-  els.siteLabel.textContent = [draft.site ?? "generic", draft.mediaUrl ? "media selected" : "page selected"].join(" - ");
   renderWorkflowState();
   renderDebugPanel();
 }
@@ -543,7 +1198,13 @@ function renderPreview(): void {
     return;
   }
 
-  resetMediaMetadata(url);
+  const cached = queueItemById(selectedQueueItemId)?.mediaMetadata;
+  if (cached?.url === url) {
+    mediaMetadata = cached;
+    renderMediaMetadata();
+  } else {
+    resetMediaMetadata(url);
+  }
   void fetchHeadMediaMetadata(url, requestId);
 
   if (isVideoUrl(url)) {
@@ -619,6 +1280,7 @@ function updateMediaMetadata(url: string, requestId: number, next: Partial<Media
   };
   renderMediaMetadata();
   renderDebugPanel();
+  persistSelectedQueueItemEditsDebounced();
 }
 
 function renderMediaMetadata(): void {
@@ -683,11 +1345,14 @@ async function persistSettings(): Promise<void> {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
+    multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
   });
   await saveSettings(settings);
   renderSettings(settings);
   renderDebugPanel();
+  await syncCaptureStateToActiveTab();
   showSettingsSavedFeedback();
   setStatus("Settings saved.", "success");
 }
@@ -704,6 +1369,8 @@ function renderSettings(nextSettings: AppSettings): void {
   els.closeAfterImport.checked = nextSettings.closeAfterImport;
   els.clearPanelAfterImportDefault.checked = nextSettings.clearPanelAfterImportDefault;
   els.misskeyArtistMode.value = nextSettings.misskeyArtistMode;
+  els.multiAddCaptureLeftClick.checked = nextSettings.multiAddCaptureLeftClick;
+  els.multiAddCaptureRightClick.checked = nextSettings.multiAddCaptureRightClick;
   els.debugMode.checked = nextSettings.debugMode;
 }
 
@@ -713,6 +1380,7 @@ async function importNoAi(): Promise<void> {
     const payload = buildFinalPayload();
     const upload = await uploadCurrentMedia(api, payload);
     markUploaded(upload, { finalSaved: true });
+    if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", "Imported.", upload.link);
     setSuccess("Imported.", upload.link);
   });
 }
@@ -729,6 +1397,7 @@ async function importAiAuto(): Promise<void> {
     try {
       predictions = (await api.predict(mediaId)).map(normalizePrediction).filter((item): item is AiTagPrediction => Boolean(item));
     } catch {
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "error", "Imported, but AI tagging failed.", upload.link, "AI tagging failed.");
       setLinkedStatus("Imported, but AI tagging failed.", upload.link);
       return;
     }
@@ -751,6 +1420,7 @@ async function importAiAuto(): Promise<void> {
       manualState = undefined;
       markUploaded(patched.link ? patched : upload, { mediaId, finalSaved: true });
       renderWorkflowState();
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", `Imported with ${selected.length} AI tags.`, patched.link || upload.link);
       setSuccess(`Imported with ${selected.length} AI tags.`, patched.link || upload.link);
     } catch {
       manualState = {
@@ -762,6 +1432,7 @@ async function importAiAuto(): Promise<void> {
       };
       renderManualPredictions(predictions, selected.map((prediction) => prediction.name));
       renderWorkflowState();
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "error", "Imported and AI predicted, but saving final tags failed.", upload.link, "Saving final tags failed.");
       setLinkedStatus("Imported and AI predicted, but saving final tags failed. Review the tags and click Save Final Tags.", upload.link, "error");
     }
   });
@@ -779,6 +1450,7 @@ async function importAiManual(): Promise<void> {
     try {
       predictions = (await api.predict(mediaId)).map(normalizePrediction).filter((item): item is AiTagPrediction => Boolean(item));
     } catch {
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "error", "Imported, but AI tagging failed.", upload.link, "AI tagging failed.");
       setLinkedStatus("Imported, but AI tagging failed.", upload.link);
       return;
     }
@@ -855,6 +1527,7 @@ function updateMediaMetadataAfterBlob(url: string, bytes: number, mimeType: stri
   };
   renderMediaMetadata();
   renderDebugPanel();
+  persistSelectedQueueItemEditsDebounced();
 }
 
 function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
@@ -977,6 +1650,7 @@ async function saveManualFinalTags(): Promise<void> {
     els.manualList.replaceChildren();
     markUploaded(patched.link ? patched : { ...patched, link: state.link }, { mediaId: state.mediaId, finalSaved: true });
     renderWorkflowState();
+    if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", "Final tags saved.", patched.link || state.link);
     setSuccess("Final tags saved.", patched.link || state.link);
   });
 }
@@ -1014,6 +1688,8 @@ function requireConfiguredApi(): BlombooruApi {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
+    multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
   });
 
@@ -1040,26 +1716,33 @@ async function runImport(work: () => Promise<void>): Promise<void> {
 
 function handleError(error: unknown): void {
   if (error instanceof BlombooruDuplicateError) {
+    if (selectedQueueItemId) void setQueueItemStatus(selectedQueueItemId, "duplicate", "Already imported.", error.result?.link);
     setLinkedStatus("Already imported.", error.result?.link);
     return;
   }
 
   if (error instanceof BlombooruAuthError) {
+    if (selectedQueueItemId) void setQueueItemStatus(selectedQueueItemId, "error", "Blombooru rejected the API key.", undefined, error.message);
     setStatus("Blombooru rejected the API key. Check settings and try again.", "error");
     return;
   }
 
   if (error instanceof BlombooruApiError) {
+    if (selectedQueueItemId) void setQueueItemStatus(selectedQueueItemId, "error", error.message, undefined, error.message);
     setStatus(error.message, "error");
     return;
   }
 
+  if (selectedQueueItemId) {
+    const message = error instanceof Error ? error.message : "Import failed.";
+    void setQueueItemStatus(selectedQueueItemId, "error", message, undefined, message);
+  }
   setStatus(error instanceof Error ? error.message : "Import failed.", "error");
 }
 
 function setBusy(nextBusy: boolean): void {
   busy = nextBusy;
-  for (const button of [els.import, els.importAuto, els.importManual, els.saveFinal]) {
+  for (const button of [els.import, els.importAuto, els.importManual, els.saveFinal, els.importQueue, els.importQueueAuto, els.clearQueue, els.multiAddToggle]) {
     button.disabled = nextBusy;
   }
 }
@@ -1287,6 +1970,15 @@ function buildDebugReport(): Record<string, unknown> {
     mediaMetadata,
     pendingTabId,
     pendingCreatedAt,
+    queue: currentQueue
+      ? {
+          tabId: currentQueue.tabId,
+          captureEnabled: currentQueue.captureEnabled,
+          selectedItemId: selectedQueueItemId,
+          itemCount: currentQueue.items.length,
+          statuses: currentQueue.items.map((item) => ({ id: item.id, status: item.status, message: item.statusMessage }))
+        }
+      : undefined,
     manual: manualState
       ? {
           mediaId: manualState.mediaId,

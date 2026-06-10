@@ -28,7 +28,7 @@ Open the extension options page or the Settings section in the side panel and se
 - Default rating
 - AI model name, default `wd-eva02-large-tagger-v3`
 - AI auto thresholds
-- Hide AI rating tags, close-after-import, clear-panel default, Misskey artist naming, and debug mode preferences
+- Hide AI rating tags, close-after-import, clear-panel default, Misskey artist naming, multi-add click capture, and debug mode preferences
 
 The API key is stored only in `chrome.storage.local`, not `chrome.storage.sync`.
 
@@ -48,11 +48,21 @@ Clicked media is preferred when present. For page or empty-space right-clicks, B
 
 Clicking the Boo Check toolbar icon reopens the side panel and restores the most recent side-panel workflow state unless a newer right-click draft exists. Use **Clear Side Panel** to reset the draft, fields, manual suggestions, result popup, and debug snapshot without clearing settings.
 
+## Multi-add queue
+
+Use **Enable multi-add** in the side panel to collect several posts from the active tab. While enabled, Boo Check intercepts the configured click types on the page, blocks the normal website action, extracts the clicked post or media with the same adapters used by the context menu flow, and appends it to the active tab's queue.
+
+The queue is stored in the browser session per tab. Select a queued item to review the preview, original media dimensions/size, source URL, artist, rating, and tags. Edits are saved back to the selected queue item when you switch rows or import.
+
+The multi-add settings control whether left-clicks, right-clicks, or both are captured. Right-click capture is enabled by default; left-click capture starts off.
+
 ## Import flows
 
 - **Import** uploads with the current fields and no AI.
 - **Import + AI Auto** uploads first, runs Blombooru AI prediction against the returned media ID, appends tags above configured thresholds, then patches the final tag list.
 - **Import + AI Manual** uploads first, runs AI prediction, shows tag confidence checkboxes, lets you append selected tags, then saves final tags.
+- **Import Queue** imports queued items sequentially with their saved fields.
+- **Import Queue + AI Auto** imports queued items sequentially, runs Blombooru AI after each upload, merges selected AI tags with each queued item's existing tags, then patches final tags.
 
 Before upload, Boo Check fetches the media, computes SHA-256 locally with `crypto.subtle.digest`, and renames the file to `<sha256>.<extension>`.
 
