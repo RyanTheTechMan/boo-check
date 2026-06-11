@@ -9,35 +9,54 @@ import type { SiteAdapter } from ".";
 const FOUR_CHAN_BOARD_HOSTS = new Set(["boards.4chan.org", "boards.4channel.org"]);
 const FOUR_CHAN_CDN_HOST_RE = /(^|\.)4cdn\.org$/i;
 
+export type FourChanContext = {
+  board?: string;
+  threadId?: string;
+  thumbnailMediaId?: string;
+  catalogue?: boolean;
+  sourceUrl?: string;
+  previewUrl?: string;
+  originalUrl?: string;
+  resolvedOriginal?: boolean;
+};
+
 export const fourChanAdapter: SiteAdapter = {
-  detect(draft: ImportDraft): boolean {
+  detect(draft: ImportDraft, target?: Element): boolean {
     if (!isFourChanBoardHost(location.hostname)) return false;
     return Boolean(
       fourChanThreadUrl(document.querySelector<HTMLLinkElement>("link[rel='canonical']")?.href) ||
         fourChanThreadUrl(draft.pageUrl) ||
-        fourChanThreadUrl(location.href)
+        fourChanThreadUrl(location.href) ||
+        findFourChanCatalogueContext(target)
     );
   },
 
   extract(draft: ImportDraft, target?: Element): ImportDraft {
+    const catalogueContext = findFourChanCatalogueContext(target);
     const post = findFourChanPost(target);
     const file = findFourChanFile(target, post);
     const originalUrl =
-      originalMediaUrlFromFile(file) ||
-      originalMediaUrlFromFile(post) ||
-      (isFourChanCdnMediaUrl(draft.sourceUrl) ? absoluteUrl(draft.sourceUrl) : undefined) ||
-      (isFourChanCdnMediaUrl(draft.mediaUrl) && !isFourChanThumbnailUrl(draft.mediaUrl) ? absoluteUrl(draft.mediaUrl) : undefined) ||
-      mediaUrlFromElement(target);
+      catalogueContext
+        ? originalMediaUrlFromDraft(draft)
+        : originalMediaUrlFromFile(file) ||
+          originalMediaUrlFromFile(post) ||
+          originalMediaUrlFromDraft(draft) ||
+          mediaUrlFromElement(target);
     const previewUrl =
+      catalogueContext?.previewUrl ||
       thumbnailUrlFromFile(file) ||
       thumbnailUrlFromFile(post) ||
       previewUrlFromElement(target) ||
       absoluteUrl(draft.previewUrl) ||
       originalUrl;
+    const parsedThreadInfo =
+      fourChanThreadInfo(document.querySelector<HTMLLinkElement>("link[rel='canonical']")?.href) ||
+      fourChanThreadInfo(draft.pageUrl) ||
+      fourChanThreadInfo(location.href);
+    const threadContext = catalogueContext ?? parsedThreadInfo;
     const sourceUrl =
-      fourChanThreadUrl(document.querySelector<HTMLLinkElement>("link[rel='canonical']")?.href) ||
-      fourChanThreadUrl(draft.pageUrl) ||
-      fourChanThreadUrl(location.href) ||
+      catalogueContext?.sourceUrl ||
+      parsedThreadInfo?.url ||
       absoluteUrl(draft.pageUrl) ||
       location.href;
 
@@ -51,22 +70,43 @@ export const fourChanAdapter: SiteAdapter = {
       posterName: undefined,
       artistTag: undefined,
       caption: undefined,
-      hashtags: undefined
+      hashtags: undefined,
+      raw: {
+        ...rawRecord(draft.raw),
+        fourChan: {
+          board: threadContext?.board,
+          threadId: threadContext?.threadId,
+          thumbnailMediaId: catalogueContext?.thumbnailMediaId ?? mediaIdFromFourChanThumbnail(previewUrl),
+          catalogue: Boolean(catalogueContext),
+          sourceUrl,
+          previewUrl,
+          originalUrl,
+          resolvedOriginal: Boolean(originalUrl && !isFourChanThumbnailUrl(originalUrl))
+        } satisfies FourChanContext
+      }
     };
   }
 };
 
 export function fourChanThreadUrl(value: string | undefined): string | undefined {
+  return fourChanThreadInfo(value)?.url;
+}
+
+export function fourChanThreadInfo(value: string | undefined): { url: string; board: string; threadId: string } | undefined {
   const absolute = absoluteUrl(value);
   if (!absolute) return undefined;
 
   try {
     const url = new URL(absolute);
-    if (!isFourChanBoardHost(url.hostname)) return undefined;
-    if (!fourChanThreadParts(url)) return undefined;
+    const parts = fourChanThreadParts(url);
+    if (!isFourChanBoardHost(url.hostname) || !parts) return undefined;
     url.search = "";
     url.hash = "";
-    return url.href;
+    return {
+      url: url.href,
+      board: parts.board,
+      threadId: parts.threadId
+    };
   } catch {
     return undefined;
   }
@@ -106,6 +146,29 @@ function findFourChanFile(target: Element | undefined, post: Element | undefined
   return target?.closest(".file") ?? post?.querySelector(".file") ?? undefined;
 }
 
+function findFourChanCatalogueContext(target: Element | undefined): FourChanContext | undefined {
+  const tile = target?.closest("#threads .thread, .thread");
+  if (!tile) return undefined;
+  const link = target?.closest<HTMLAnchorElement>("a[href*='/thread/']") ?? tile.querySelector<HTMLAnchorElement>("a[href*='/thread/']");
+  const threadInfo = fourChanThreadInfo(link?.href);
+  if (!threadInfo) return undefined;
+
+  const image =
+    target instanceof HTMLImageElement && target.classList.contains("thumb")
+      ? target
+      : tile.querySelector<HTMLImageElement>("img.thumb[src], img[id^='thumb-'][src]");
+  const previewUrl = absoluteUrl(image?.currentSrc || image?.src);
+
+  return {
+    board: threadInfo.board,
+    threadId: threadInfo.threadId,
+    thumbnailMediaId: mediaIdFromFourChanThumbnail(previewUrl),
+    catalogue: true,
+    sourceUrl: threadInfo.url,
+    previewUrl
+  };
+}
+
 function originalMediaUrlFromFile(root: Element | undefined): string | undefined {
   if (!root) return undefined;
   const links = [
@@ -120,6 +183,12 @@ function originalMediaUrlFromFile(root: Element | undefined): string | undefined
   }
 
   return undefined;
+}
+
+function originalMediaUrlFromDraft(draft: ImportDraft): string | undefined {
+  const sourceUrl = isFourChanCdnMediaUrl(draft.sourceUrl) && !isFourChanThumbnailUrl(draft.sourceUrl) ? absoluteUrl(draft.sourceUrl) : undefined;
+  const mediaUrl = isFourChanCdnMediaUrl(draft.mediaUrl) && !isFourChanThumbnailUrl(draft.mediaUrl) ? absoluteUrl(draft.mediaUrl) : undefined;
+  return sourceUrl || mediaUrl;
 }
 
 function thumbnailUrlFromFile(root: Element | undefined): string | undefined {
@@ -151,4 +220,20 @@ function isFourChanThumbnailUrl(value: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+function mediaIdFromFourChanThumbnail(value: string | undefined): string | undefined {
+  const absolute = absoluteUrl(value);
+  if (!absolute) return undefined;
+
+  try {
+    const match = new URL(absolute).pathname.match(/\/(\d+)s\.jpe?g$/i);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+function rawRecord(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
 }

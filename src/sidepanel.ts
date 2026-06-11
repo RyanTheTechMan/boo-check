@@ -2068,6 +2068,9 @@ async function fetchCurrentMediaAsStableFile(mediaUrls: string[]): Promise<{ url
 }
 
 function mediaFetchCandidates(): string[] {
+  if (isFourChanCatalogueDraft(draft)) {
+    return fullQualityUrlCandidates([draft.mediaUrl]);
+  }
   return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
 }
 
@@ -2091,6 +2094,10 @@ function missingMediaUrlMessage(): string {
 
   if (sawXVideo) {
     return "No importable X video URL found. X exposed only a blob, HLS playlist, segment, or thumbnail in this page snapshot. Open or play the video once, reopen Boo Check from the context menu, and try again; if it still fails, copy the debug report.";
+  }
+
+  if (isFourChanCatalogueDraft(draft)) {
+    return "No importable 4chan original URL found. The catalogue thumbnail was ignored; open the thread or retry after the catalogue API updates.";
   }
 
   return "No media URL found. Try right-clicking directly on the image or video.";
@@ -3005,6 +3012,7 @@ function isProbableThumbnailUrl(value: string): boolean {
     const path = url.pathname.toLowerCase();
     return (
       /\/thumbnail(?:[-/]|$)/i.test(path) ||
+      (/\.4cdn\.org$/i.test(url.hostname) && /\/\d+s\.jpe?g$/i.test(path)) ||
       path.includes("thumbnail.webp") ||
       path.includes("preview.webp") ||
       path.includes("static.webp") ||
@@ -3017,6 +3025,33 @@ function isProbableThumbnailUrl(value: string): boolean {
   } catch {
     return /thumbnail|preview|static/i.test(value);
   }
+}
+
+function isFourChanCatalogueDraft(nextDraft: ImportDraft): boolean {
+  return nextDraft.site === "4chan" && fourChanRawContexts(nextDraft.raw).some((context) => context.catalogue === true);
+}
+
+function fourChanRawContexts(raw: unknown): Array<{ catalogue?: boolean }> {
+  const contexts: Array<{ catalogue?: boolean }> = [];
+  const seen = new Set<object>();
+
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+
+    const record = value as Record<string, unknown>;
+    const context = record.fourChan;
+    if (context && typeof context === "object") {
+      contexts.push(context as { catalogue?: boolean });
+    }
+
+    for (const child of Object.values(record)) {
+      visit(child);
+    }
+  };
+
+  visit(raw);
+  return contexts;
 }
 
 function formatPercent(value: number | undefined): string {

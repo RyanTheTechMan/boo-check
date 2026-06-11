@@ -1,5 +1,5 @@
 import { extractImportDraft } from "./adapters";
-import { fourChanThreadUrl } from "./adapters/fourChan";
+import { fourChanThreadInfo, fourChanThreadUrl, type FourChanContext } from "./adapters/fourChan";
 import {
   activeMisskeyPhotoSwipeImage,
   attachMisskeyRememberedContext,
@@ -98,6 +98,12 @@ type XGraphqlVideoEnrichment = {
   errors: string[];
 };
 
+type FourChanApiPost = {
+  no?: number | string;
+  tim?: number | string;
+  ext?: string;
+};
+
 type MisskeyMediaContext = {
   draft: ImportDraft;
   capturedAt: number;
@@ -105,11 +111,17 @@ type MisskeyMediaContext = {
 };
 
 const MISSKEY_CONTEXT_MAX_AGE_MS = 10 * 60 * 1000;
+const FOUR_CHAN_API_MIN_INTERVAL_MS = 1100;
+const FOUR_CHAN_CATALOG_CACHE_MS = 30 * 1000;
 
 let lastContextMenuTarget: Element | undefined;
 let lastContextMenuPoint: { clientX: number; clientY: number } | undefined;
 let lastMisskeyMediaContext: MisskeyMediaContext | undefined;
 let twitterApiMetadataPromise: Promise<TwitterApiMetadata | undefined> | undefined;
+let fourChanLastApiFetchAt = 0;
+let fourChanApiQueue: Promise<unknown> = Promise.resolve();
+const fourChanCatalogCache = new Map<string, { fetchedAt: number; posts: FourChanApiPost[] }>();
+const fourChanCatalogPromises = new Map<string, Promise<FourChanApiPost[]>>();
 let multiAddCaptureEnabled = false;
 let multiAddCaptureLeftClick = false;
 let multiAddCaptureRightClick = true;
@@ -399,6 +411,8 @@ function findAutoCollectContainers(): Element[] {
       "[class*='MkNote-root']",
       "[class*='Note-root']",
       "._panel",
+      "#threads .thread",
+      "img.thumb[src]",
       ".opContainer",
       ".replyContainer",
       ".postContainer",
@@ -424,6 +438,11 @@ function normalizeAutoCollectContainer(element: Element | undefined): Element | 
 
   const cell = element.closest("[data-testid='cellInnerDiv']") ?? (element.matches("[data-testid='cellInnerDiv']") ? element : undefined);
   if (cell?.querySelector("a[href*='/status/']")) return cell;
+
+  const fourChanCatalogueThread = element.matches("#threads .thread")
+    ? element
+    : element.closest("#threads .thread");
+  if (fourChanCatalogueThread?.querySelector("a[href*='/thread/'] img.thumb[src], img.thumb[src]")) return fourChanCatalogueThread;
 
   const fourChanPost = element.matches(".post, .opContainer, .replyContainer, .postContainer")
     ? element
@@ -543,6 +562,7 @@ function autoCollectMediaTargets(container: Element): Element[] {
       "[data-testid='tweetPhoto'] video",
       "[data-testid='videoPlayer'] video",
       "a[href*='/photo/'] img",
+      "img.thumb[src]",
       "a[href*='/files/']",
       "a[href*='/proxy/']",
       "a[href*='url=']",
@@ -591,13 +611,14 @@ function autoCollectElementKey(element: Element, url: string): string {
 
 function autoCollectContainerKind(container: Element): string {
   if (container.matches("article[data-testid='tweet'], [data-testid='cellInnerDiv']")) return "x-timeline-post";
+  if (container.matches("#threads .thread")) return "4chan-catalog-thread";
   if (container.matches(".post, .opContainer, .replyContainer, .postContainer")) return "4chan-thread-post";
   if (container.matches("[to^='/notes/'], [to^='/clips/'], ._panel, [data-scroll-anchor]")) return "misskey-timeline-post";
   return "post-container";
 }
 
 function isAutoCollectExcludedMediaElement(element: Element): boolean {
-  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer'], a.fileThumb, .file, .fileText, [class*='MkMedia'], [class*='media' i], [class*='Media' i]")) {
+  if (element.closest("[data-testid='tweetPhoto'], [data-testid='videoPlayer'], #threads .thread, a.fileThumb, .file, .fileText, [class*='MkMedia'], [class*='media' i], [class*='Media' i]")) {
     return false;
   }
 
@@ -661,15 +682,17 @@ async function extractDraftWithDebug(inputDraft: ImportDraft, target: Element | 
     misskeyContextForExtraction(target)
   );
   let draft = extractImportDraft(pendingDraft, target);
-  const asyncDebug = await enrichXVideoFromGraphqlIfNeeded(pendingDraft, draft, target);
-  draft = asyncDebug.draft;
+  const xDebug = await enrichXVideoFromGraphqlIfNeeded(pendingDraft, draft, target);
+  draft = xDebug.draft;
+  const fourChanDebug = await enrichFourChanCatalogueIfNeeded(draft);
+  draft = fourChanDebug.draft;
   if (draft.site === "misskey" && isUsableMisskeyContext(draft)) {
     rememberMisskeyMediaContext(target);
   }
   const debug = buildDebugSnapshot(pendingDraft, draft, target, {
-    mediaCandidates: asyncDebug.mediaCandidates,
-    notes: asyncDebug.notes,
-    errors: asyncDebug.errors
+    mediaCandidates: [...xDebug.mediaCandidates, ...fourChanDebug.mediaCandidates],
+    notes: [...xDebug.notes, ...fourChanDebug.notes],
+    errors: [...xDebug.errors, ...fourChanDebug.errors]
   });
   return { draft, debug };
 }
@@ -848,6 +871,224 @@ async function enrichXVideoFromGraphqlIfNeeded(
       errors: [`X GraphQL video lookup failed: ${error instanceof Error ? error.message : "unknown error"}`]
     };
   }
+}
+
+async function enrichFourChanCatalogueIfNeeded(draft: ImportDraft): Promise<XGraphqlVideoEnrichment> {
+  const fallback = { draft, mediaCandidates: [], notes: [], errors: [] };
+  if (draft.site !== "4chan") return fallback;
+
+  const context = fourChanContextFromDraft(draft);
+  if (!context?.catalogue) return fallback;
+
+  const unresolvedDraft = {
+    ...draft,
+    mediaUrl: isFourChanThumbnailUrl(draft.mediaUrl) ? undefined : draft.mediaUrl,
+    raw: updateFourChanContext(draft.raw, {
+      ...context,
+      resolvedOriginal: Boolean(draft.mediaUrl && !isFourChanThumbnailUrl(draft.mediaUrl))
+    })
+  };
+  const unresolvedCandidate = context.previewUrl
+    ? [{
+        originalUrl: context.previewUrl,
+        canonicalUrl: context.previewUrl,
+        source: "4chan catalogue thumbnail",
+        score: 100,
+        accepted: false,
+        rejectionReason: "catalogue thumbnail ignored while resolving original media"
+      } satisfies DebugMediaCandidate]
+    : [];
+
+  if (unresolvedDraft.mediaUrl) return { ...fallback, draft: unresolvedDraft };
+  if (!context.board || !context.threadId) {
+    return {
+      draft: unresolvedDraft,
+      mediaCandidates: unresolvedCandidate,
+      notes: ["4chan catalogue original lookup skipped because board or thread id was missing."],
+      errors: []
+    };
+  }
+
+  try {
+    const post = await findFourChanApiPost(context);
+    const mediaUrl = post ? fourChanApiMediaUrl(context.board, post) : undefined;
+    if (!mediaUrl) {
+      return {
+        draft: unresolvedDraft,
+        mediaCandidates: unresolvedCandidate,
+        notes: ["4chan catalogue lookup did not find an API post with matching tim/ext media metadata."],
+        errors: []
+      };
+    }
+
+    return {
+      draft: {
+        ...draft,
+        mediaUrl,
+        previewUrl: context.previewUrl || draft.previewUrl,
+        raw: updateFourChanContext(draft.raw, {
+          ...context,
+          originalUrl: mediaUrl,
+          resolvedOriginal: true
+        })
+      },
+      mediaCandidates: [
+        ...unresolvedCandidate,
+        {
+          originalUrl: mediaUrl,
+          canonicalUrl: mediaUrl,
+          source: "4chan JSON API original media",
+          score: 10000,
+          accepted: true,
+          selected: true
+        }
+      ],
+      notes: [`Selected ${mediaUrl} from 4chan JSON API metadata.`],
+      errors: []
+    };
+  } catch (error) {
+    return {
+      draft: unresolvedDraft,
+      mediaCandidates: unresolvedCandidate,
+      notes: [],
+      errors: [`4chan catalogue original lookup failed: ${error instanceof Error ? error.message : "unknown error"}`]
+    };
+  }
+}
+
+async function findFourChanApiPost(context: FourChanContext): Promise<FourChanApiPost | undefined> {
+  if (!context.board || !context.threadId) return undefined;
+
+  try {
+    const catalogPost = (await fetchFourChanCatalogPosts(context.board)).find((post) => fourChanApiPostMatchesContext(post, context));
+    if (catalogPost) return catalogPost;
+  } catch {
+    // Fall back to the individual thread endpoint below.
+  }
+
+  const threadPosts = await fetchFourChanThreadPosts(context.board, context.threadId);
+  return threadPosts.find((post) => fourChanApiPostMatchesContext(post, context));
+}
+
+function fourChanApiPostMatchesContext(post: FourChanApiPost, context: FourChanContext): boolean {
+  if (String(post.no ?? "") !== String(context.threadId ?? "")) return false;
+  if (!post.tim || !post.ext) return false;
+  return !context.thumbnailMediaId || String(post.tim) === context.thumbnailMediaId;
+}
+
+function fourChanApiMediaUrl(board: string, post: FourChanApiPost): string | undefined {
+  const tim = String(post.tim ?? "");
+  const ext = String(post.ext ?? "");
+  if (!/^\d+$/.test(tim) || !/^\.[A-Za-z0-9]+$/.test(ext)) return undefined;
+  return `https://i.4cdn.org/${board}/${tim}${ext}`;
+}
+
+async function fetchFourChanCatalogPosts(board: string): Promise<FourChanApiPost[]> {
+  const cached = fourChanCatalogCache.get(board);
+  if (cached && Date.now() - cached.fetchedAt < FOUR_CHAN_CATALOG_CACHE_MS) return cached.posts;
+
+  const pending = fourChanCatalogPromises.get(board);
+  if (pending) return pending;
+
+  const promise = fetchFourChanJsonQueued(`https://a.4cdn.org/${board}/catalog.json`)
+    .then(extractFourChanCatalogPosts)
+    .then((posts) => {
+      fourChanCatalogCache.set(board, { fetchedAt: Date.now(), posts });
+      return posts;
+    })
+    .finally(() => {
+      fourChanCatalogPromises.delete(board);
+    });
+  fourChanCatalogPromises.set(board, promise);
+  return promise;
+}
+
+async function fetchFourChanThreadPosts(board: string, threadId: string): Promise<FourChanApiPost[]> {
+  const json = await fetchFourChanJsonQueued(`https://a.4cdn.org/${board}/thread/${threadId}.json`);
+  if (!json || typeof json !== "object") return [];
+  const posts = (json as { posts?: unknown }).posts;
+  return Array.isArray(posts) ? posts.filter(isFourChanApiPost) : [];
+}
+
+function extractFourChanCatalogPosts(value: unknown): FourChanApiPost[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((page) => {
+    const threads = page && typeof page === "object" ? (page as { threads?: unknown }).threads : undefined;
+    return Array.isArray(threads) ? threads.filter(isFourChanApiPost) : [];
+  });
+}
+
+function isFourChanApiPost(value: unknown): value is FourChanApiPost {
+  return Boolean(value && typeof value === "object");
+}
+
+async function fetchFourChanJsonQueued(url: string): Promise<unknown> {
+  const run = fourChanApiQueue.then(async () => {
+    const waitMs = Math.max(0, fourChanLastApiFetchAt + FOUR_CHAN_API_MIN_INTERVAL_MS - Date.now());
+    if (waitMs > 0) await delay(waitMs);
+    fourChanLastApiFetchAt = Date.now();
+
+    const response = await fetch(url, {
+      credentials: "omit",
+      headers: { accept: "application/json" }
+    });
+    if (!response.ok) throw new Error(`${url} returned ${response.status}`);
+    return response.json();
+  });
+  fourChanApiQueue = run.catch(() => undefined);
+  return run;
+}
+
+function fourChanContextFromDraft(draft: ImportDraft): FourChanContext | undefined {
+  const context = rawObject(draft.raw).fourChan;
+  if (context && typeof context === "object") return context as FourChanContext;
+
+  const threadInfo = fourChanThreadInfo(draft.sourceUrl || draft.pageUrl);
+  if (!threadInfo) return undefined;
+  return {
+    board: threadInfo.board,
+    threadId: threadInfo.threadId,
+    sourceUrl: threadInfo.url,
+    previewUrl: draft.previewUrl,
+    thumbnailMediaId: fourChanThumbnailMediaId(draft.previewUrl || draft.mediaUrl),
+    catalogue: isFourChanThumbnailUrl(draft.mediaUrl) || isFourChanThumbnailUrl(draft.previewUrl)
+  };
+}
+
+function updateFourChanContext(raw: unknown, context: FourChanContext): Record<string, unknown> {
+  return {
+    ...rawObject(raw),
+    fourChan: {
+      ...(fourChanContextFromRaw(raw) ?? {}),
+      ...context
+    }
+  };
+}
+
+function fourChanContextFromRaw(raw: unknown): FourChanContext | undefined {
+  const context = rawObject(raw).fourChan;
+  return context && typeof context === "object" ? context as FourChanContext : undefined;
+}
+
+function isFourChanThumbnailUrl(value: string | undefined): boolean {
+  return Boolean(fourChanThumbnailMediaId(value));
+}
+
+function fourChanThumbnailMediaId(value: string | undefined): string | undefined {
+  const absolute = absoluteUrl(value);
+  if (!absolute) return undefined;
+  try {
+    const url = new URL(absolute);
+    return /\.4cdn\.org$/i.test(url.hostname) || url.hostname === "i.4cdn.org"
+      ? url.pathname.match(/\/(\d+)s\.jpe?g$/i)?.[1]
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function isXVideoRoute(value: string): boolean {
