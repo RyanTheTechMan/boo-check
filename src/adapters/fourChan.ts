@@ -12,6 +12,7 @@ const FOUR_CHAN_CDN_HOST_RE = /(^|\.)4cdn\.org$/i;
 export type FourChanContext = {
   board?: string;
   threadId?: string;
+  postId?: string;
   thumbnailMediaId?: string;
   catalogue?: boolean;
   sourceUrl?: string;
@@ -54,11 +55,13 @@ export const fourChanAdapter: SiteAdapter = {
       fourChanThreadInfo(draft.pageUrl) ||
       fourChanThreadInfo(location.href);
     const threadContext = catalogueContext ?? parsedThreadInfo;
-    const sourceUrl =
+    const postId = catalogueContext?.postId || postIdFromFourChanTarget(target, file, post);
+    const baseSourceUrl =
       catalogueContext?.sourceUrl ||
       parsedThreadInfo?.url ||
       absoluteUrl(draft.pageUrl) ||
       location.href;
+    const sourceUrl = addFourChanPostAnchor(baseSourceUrl, postId) || baseSourceUrl;
 
     return {
       ...draft,
@@ -76,6 +79,7 @@ export const fourChanAdapter: SiteAdapter = {
         fourChan: {
           board: threadContext?.board,
           threadId: threadContext?.threadId,
+          postId,
           thumbnailMediaId: catalogueContext?.thumbnailMediaId ?? mediaIdFromFourChanThumbnail(previewUrl),
           catalogue: Boolean(catalogueContext),
           sourceUrl,
@@ -146,8 +150,46 @@ function findFourChanFile(target: Element | undefined, post: Element | undefined
   return target?.closest(".file") ?? post?.querySelector(".file") ?? undefined;
 }
 
+function postIdFromFourChanTarget(
+  target: Element | undefined,
+  file: Element | undefined,
+  post: Element | undefined
+): string | undefined {
+  const postId = post?.id.match(/^p(\d+)$/)?.[1];
+  if (postId) return postId;
+
+  const candidates = [
+    target,
+    file,
+    target?.closest("[id]") ?? undefined,
+    file?.closest("[id]") ?? undefined,
+    post
+  ];
+
+  for (const element of candidates) {
+    const id = element?.id;
+    const match = id?.match(/^(?:p|pc|f|m|pi|pim|sa|bl_)(\d+)$/);
+    if (match) return match[1];
+  }
+
+  return undefined;
+}
+
+function addFourChanPostAnchor(value: string | undefined, postId: string | undefined): string | undefined {
+  const absolute = absoluteUrl(value);
+  if (!absolute || !postId) return absolute;
+
+  try {
+    const url = new URL(absolute);
+    url.hash = `p${postId}`;
+    return url.href;
+  } catch {
+    return absolute;
+  }
+}
+
 function findFourChanCatalogueContext(target: Element | undefined): FourChanContext | undefined {
-  const tile = target?.closest("#threads .thread, .thread");
+  const tile = target?.closest("#threads .thread");
   if (!tile) return undefined;
   const link = target?.closest<HTMLAnchorElement>("a[href*='/thread/']") ?? tile.querySelector<HTMLAnchorElement>("a[href*='/thread/']");
   const threadInfo = fourChanThreadInfo(link?.href);
@@ -162,6 +204,7 @@ function findFourChanCatalogueContext(target: Element | undefined): FourChanCont
   return {
     board: threadInfo.board,
     threadId: threadInfo.threadId,
+    postId: threadInfo.threadId,
     thumbnailMediaId: mediaIdFromFourChanThumbnail(previewUrl),
     catalogue: true,
     sourceUrl: threadInfo.url,
