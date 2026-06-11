@@ -19,11 +19,29 @@ npm run dev
 
 The dev command watches and rebuilds `dist/`; reload the unpacked extension in Chrome after changes.
 
+## Chrome Web Store package
+
+Build and create the upload ZIP:
+
+```bash
+npm run package
+```
+
+The Chrome Web Store upload file is written to `release/boo-check-<version>.zip`. Upload that ZIP in the Chrome Web Store Developer Dashboard; do not upload the repo folder or `dist/` folder directly.
+
+To create a CRX for side-loading or self-hosted distribution:
+
+```bash
+npm run package:crx
+```
+
+The CRX is written to `release/boo-check-<version>.crx`. The first CRX build also creates `release/boo-check.pem`; keep that private and reuse it for future CRX builds so the extension ID stays stable. Do not upload the CRX to the Chrome Web Store.
+
 ## Configure
 
 Open the extension options page or the Settings section in the side panel and set:
 
-- Blombooru base URL, for example `http://10.10.1.149:8000`
+- Blombooru base URL, for example `http://192.168.1.123:8000`
 - Blombooru API key
 - Default rating
 - AI model name, default `wd-eva02-large-tagger-v3`
@@ -86,13 +104,6 @@ All endpoint paths are centralized in `src/api/blombooru.ts`:
 - `GET /api/tags/autocomplete?q=<query>`, with fallback to `query=<query>`
 - Best-effort `POST /api/tags/` for category creation when available
 
-Expected response shapes are intentionally loose:
-
-- Upload/update media ID can be `id`, `media_id`, `media.id`, `item.id`, or `data.id`.
-- AI predictions can be under `tags`, `predictions`, `results`, `data.tags`, or `data.predictions`.
-- AI tags can be objects such as `{ "name": "1girl", "category": "general", "confidence": 0.91 }`, grouped arrays, or grouped maps such as `{ "general": { "solo": 0.88 } }`.
-- Autocomplete can return an array directly or an object with `tags`, `results`, `suggestions`, `items`, or `data`.
-
 ## Host permissions
 
 The MVP manifest uses `<all_urls>` because it needs to fetch media from arbitrary sites and call your configured Blombooru base URL. For a stricter install, edit `public/manifest.json` and restrict `host_permissions` to the sites you import from plus your Blombooru host.
@@ -111,3 +122,7 @@ The MVP manifest uses `<all_urls>` because it needs to fetch media from arbitrar
 - **Media fetch failed**: Try right-clicking the actual image/video, or open the original post page and retry.
 - **Imported, but AI tagging failed**: Upload worked, but the prediction endpoint failed or returned an unexpected error. The uploaded item remains in Blombooru.
 - **Imported and AI predicted, but saving final tags failed**: Upload and AI worked, but the final save failed. Review the textbox and click **Save Final Tags** to retry without uploading again.
+
+## AI Usage
+AI was used heavily in the development of this extension. Originally put together for friends, however, other people may find this tool useful.
+If I have the time, I will continue to refine the extension into a more polished state.

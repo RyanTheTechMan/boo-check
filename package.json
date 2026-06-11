@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite build --watch",
-    "build": "tsc --noEmit && vite build"
+    "build": "tsc --noEmit && vite build",
+    "package": "node scripts/package-extension.mjs",
+    "package:zip": "node scripts/package-extension.mjs",
+    "package:crx": "node scripts/package-crx.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",

@@ -3,13 +3,17 @@
   "name": "Boo Check",
   "version": "0.1.0",
   "description": "Import media from web pages into a self-hosted Blombooru instance.",
+  "icons": {
+    "16": "icons/boo-check-16.png",
+    "32": "icons/boo-check-32.png",
+    "48": "icons/boo-check-48.png",
+    "128": "icons/boo-check-128.png"
+  },
   "minimum_chrome_version": "116",
   "permissions": [
     "contextMenus",
     "sidePanel",
-    "storage",
-    "activeTab",
-    "scripting"
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -33,6 +37,12 @@
     "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data: blob: http: https:; media-src 'self' data: blob: http: https:; connect-src 'self' data: blob: http: https:;"
   },
   "action": {
-    "default_title": "Boo Check"
+    "default_title": "Boo Check",
+    "default_icon": {
+      "16": "icons/boo-check-16.png",
+      "32": "icons/boo-check-32.png",
+      "48": "icons/boo-check-48.png",
+      "128": "icons/boo-check-128.png"
+    }
   }
 }
