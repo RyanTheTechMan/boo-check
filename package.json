@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "package": "node scripts/package-extension.mjs",
     "package:zip": "node scripts/package-extension.mjs",
-    "package:crx": "node scripts/package-crx.mjs"
+    "package:crx": "node scripts/package-crx.mjs",
+    "prepare:blombooru": "node scripts/prepare-blombooru-import.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",

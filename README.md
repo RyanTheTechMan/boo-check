@@ -84,6 +84,18 @@ The multi-add settings control whether left-clicks, right-clicks, or both are ca
 
 Before upload, Boo Check fetches the media, computes SHA-256 locally with `crypto.subtle.digest`, and renames the file to `<sha256>.<extension>`.
 
+## Blombooru archive prep
+
+For bulk backfills through Blombooru's compressed archive import, use:
+
+```bash
+npm run prepare:blombooru -- /path/to/source-directory ./blombooru-flat --zip ./blombooru-import.zip
+```
+
+The script recursively copies supported media into one flat directory, shows terminal progress while scanning and processing, names files as `<md5>.<extension>` by default, skips byte-identical duplicates, and writes a `blombooru-import-manifest.json` file mapping each source path to the output name. MD5 is the default because Blombooru stores and searches media hashes as MD5. Use `--hash sha256` if you specifically want names to match Boo Check's browser upload naming. The optional zip archive is written directly by the script, so no separate `zip` command is required.
+
+Blombooru's archive importer currently accepts `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.mp4`, and `.webm` files.
+
 The Artist field has autocomplete and is submitted as an artist-category tag through `category_hints`; it is not inserted into the main tag textbox. In the side panel preview, artist tags render with the artist chip color. The field indicates whether the artist tag already exists or will be added on import.
 
 For Misskey, the artist field defaults to the username only. Settings can also keep the federated handle or put the domain into the normal tag textbox as a separate normalized tag.
