@@ -3,6 +3,7 @@ import {
   BlombooruApiError,
   BlombooruAuthError,
   BlombooruDuplicateError,
+  type BooruImportPost,
   type UploadMediaResult
 } from "./api/blombooru";
 import {
@@ -152,6 +153,7 @@ let mediaMetadataRequest = 0;
 let currentQueue: ImportQueueState | undefined;
 let selectedQueueItemId: string | undefined;
 let previewObjectUrl: string | undefined;
+let previewFailedUrls = new Set<string>();
 
 const autocompleteCache = new Map<string, TagSuggestion[]>();
 const artistAutocompleteCache = new Map<string, TagSuggestion[]>();
@@ -160,6 +162,8 @@ const queueMetadataRequests = new Set<string>();
 const removedQueueItemIds = new Set<string>();
 const queueClearCutoffs = new Map<number, number>();
 const RATING_VALUES: readonly Rating[] = ["safe", "questionable", "explicit"];
+const BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE =
+  "Imported, but AI tagging cannot run because Blombooru did not return a media id.";
 
 void init();
 
@@ -176,15 +180,21 @@ async function init(): Promise<void> {
     applyDraftToForm();
     renderAll();
     await enrichFromActiveTab();
-    applyDraftToForm({ preserveEditedTags: true });
+    const fetchedWithBlombooru = await enrichFromBlombooruBooruImport();
+    applyDraftToForm({ preserveEditedTags: !fetchedWithBlombooru });
     renderAll();
   } else {
     renderQueue();
   }
 
-  if (!settings.baseUrl || !settings.apiKey) {
+  if (!settings.baseUrl || (!settings.apiKey && !draft.blombooruBooruImport)) {
     els.settingsPanel.open = true;
-    setStatus("Add your Blombooru base URL and API key before importing.", "info");
+    setStatus(
+      settings.baseUrl
+        ? "Add your Blombooru API key before importing unsupported URLs or using AI."
+        : "Add your Blombooru base URL and API key before importing.",
+      "info"
+    );
   }
 
   renderDebugPanel();
@@ -264,11 +274,12 @@ function bindEvents(): void {
       renderWorkflowState();
       renderQueue();
       hideSuccessPopup();
-      void enrichFromActiveTab().then(() => {
-        applyDraftToForm();
+      void enrichFromActiveTab().then(async () => {
+        const fetchedWithBlombooru = await enrichFromBlombooruBooruImport();
+        applyDraftToForm({ preserveEditedTags: !fetchedWithBlombooru });
         renderAll();
         renderDebugPanel();
-        setStatus("Loaded new context-menu draft.", "info");
+        if (!fetchedWithBlombooru) setStatus("Loaded new context-menu draft.", "info");
         persistSidePanelStateDebounced();
       });
     }
@@ -493,6 +504,189 @@ async function enrichFromActiveTab(): Promise<void> {
     }
   } catch {
     // Some pages cannot run content scripts. Generic context-menu data is enough for MVP import.
+  }
+}
+
+async function enrichFromBlombooruBooruImport(): Promise<boolean> {
+  if (!settings.baseUrl) return false;
+
+  const candidates = await booruImportUrlCandidates();
+  if (!candidates.length) return false;
+
+  const existingOriginal = draft.blombooruBooruImport?.originalUrl;
+  if (existingOriginal && candidates.some((candidate) => normalizedQueueUrlKey(candidate) === normalizedQueueUrlKey(existingOriginal))) {
+    return false;
+  }
+
+  const api = new BlombooruApi(settings);
+  let lastError: unknown;
+
+  for (const candidate of candidates) {
+    try {
+      const post = await api.fetchBooruImport(candidate);
+      draft = mergeDrafts(draft, draftFromBlombooruBooruPost(candidate, post, api));
+      rememberBooruImportCategories(post);
+      updateBooruImportDebug({
+        endpoint: "/api/booru-import/fetch",
+        sourceUrl: candidate,
+        delegated: true,
+        tagCount: post.tags.length
+      });
+      setStatus("Fetched with Blombooru booru import.", "success");
+      return true;
+    } catch (error) {
+      lastError = error;
+      updateBooruImportDebug({
+        endpoint: "/api/booru-import/fetch",
+        sourceUrl: candidate,
+        status: error instanceof BlombooruApiError ? error.status : undefined,
+        error: error instanceof Error ? error.message : "Booru fetch failed."
+      });
+      if (error instanceof BlombooruAuthError) break;
+    }
+  }
+
+  if (lastError) renderDebugPanel();
+  return false;
+}
+
+async function booruImportUrlCandidates(): Promise<string[]> {
+  const candidates: string[] = [];
+  const add = (value: string | undefined | null): void => {
+    const url = normalizedHttpUrl(value);
+    if (url) candidates.push(url);
+  };
+
+  add(draft.sourceUrl);
+  add(draft.pageUrl);
+  for (const url of rawBooruImportCandidateUrls(draft.raw)) add(url);
+  add((await activeTabUrl()) ?? undefined);
+
+  return uniqueUrls(candidates);
+}
+
+async function activeTabUrl(): Promise<string | undefined> {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tab?.url;
+}
+
+function rawBooruImportCandidateUrls(raw: unknown): string[] {
+  const urls: string[] = [];
+  const seenObjects = new Set<object>();
+
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object" || seenObjects.has(value)) return;
+    seenObjects.add(value);
+
+    const record = value as Record<string, unknown>;
+    for (const key of ["sourceUrl", "pageUrl", "linkUrl", "booruUrl"]) {
+      const url = typeof record[key] === "string" ? normalizedHttpUrl(record[key]) : undefined;
+      if (url) urls.push(url);
+    }
+
+    for (const child of Object.values(record)) visit(child);
+  };
+
+  visit(raw);
+  return uniqueUrls(urls);
+}
+
+function draftFromBlombooruBooruPost(originalUrl: string, post: BooruImportPost, api: BlombooruApi): ImportDraft {
+  const tags = post.tags.map((tag) => normalizeTag(tag.name)).filter(Boolean);
+  const artistTag = post.tags.find((tag) => normalizeCategory(tag.category) === "artist")?.name;
+  const sourceUrl = booruImportSourceUrl(originalUrl, post);
+  const previewUrl = post.previewUrl || post.fileUrl;
+  const proxyPreviewUrl = api.booruImportProxyImageUrl(previewUrl);
+  const proxyFileUrl = api.booruImportProxyImageUrl(post.fileUrl);
+
+  return {
+    site: "booru",
+    pageUrl: post.booruUrl || originalUrl,
+    sourceUrl,
+    mediaUrl: post.fileUrl || draft.mediaUrl,
+    previewUrl: proxyFileUrl || proxyPreviewUrl || post.fileUrl || previewUrl || draft.previewUrl,
+    artistTag: normalizeTag(artistTag),
+    seedTags: tags,
+    rating: post.rating,
+    blombooruBooruImport: {
+      originalUrl,
+      booruUrl: post.booruUrl,
+      fileUrl: post.fileUrl,
+      previewUrl: post.previewUrl,
+      proxyFileUrl,
+      proxyPreviewUrl,
+      filename: post.filename,
+      width: post.width,
+      height: post.height,
+      fileSize: post.fileSize,
+      source: post.source,
+      tags: post.tags.map((tag) => ({
+        name: normalizeTag(tag.name),
+        category: normalizeCategory(tag.category),
+        isNew: tag.isNew,
+        userAssigned: tag.userAssigned
+      })).filter((tag) => tag.name),
+      fetchedAt: Date.now()
+    },
+    raw: {
+      blombooruBooruImport: {
+        originalUrl,
+        booruUrl: post.booruUrl,
+        mediaUrl: post.fileUrl,
+        previewUrl: proxyFileUrl || proxyPreviewUrl || post.fileUrl || post.previewUrl,
+        proxyFileUrl,
+        proxyPreviewUrl,
+        source: post.source
+      }
+    }
+  };
+}
+
+function booruImportSourceUrl(originalUrl: string, post: BooruImportPost): string {
+  return normalizedHttpUrl(post.source) || post.booruUrl || originalUrl;
+}
+
+function rememberBooruImportCategories(post: BooruImportPost): void {
+  for (const tag of post.tags) {
+    const name = normalizeTag(tag.name);
+    const category = normalizeCategory(tag.category);
+    if (name && category) categoryCache.set(name, category);
+  }
+}
+
+function updateBooruImportDebug(next: NonNullable<ImportDebugSnapshot["booruImport"]>): void {
+  latestDebugSnapshot = {
+    capturedAt: latestDebugSnapshot?.capturedAt ?? Date.now(),
+    pageUrl: latestDebugSnapshot?.pageUrl ?? draft.pageUrl,
+    selectedAdapter: latestDebugSnapshot?.selectedAdapter ?? draft.site,
+    pendingDraft: latestDebugSnapshot?.pendingDraft,
+    enrichedDraft: latestDebugSnapshot?.enrichedDraft,
+    rightClickTarget: latestDebugSnapshot?.rightClickTarget,
+    nearestPostContainer: latestDebugSnapshot?.nearestPostContainer,
+    candidateMediaUrls: latestDebugSnapshot?.candidateMediaUrls ?? [],
+    candidateSourceUrls: latestDebugSnapshot?.candidateSourceUrls ?? [],
+    mediaCandidates: latestDebugSnapshot?.mediaCandidates,
+    sourceCandidatesDetailed: latestDebugSnapshot?.sourceCandidatesDetailed,
+    selectionNotes: latestDebugSnapshot?.selectionNotes,
+    x: latestDebugSnapshot?.x,
+    misskey: latestDebugSnapshot?.misskey,
+    booruImport: next,
+    metaImageUrls: latestDebugSnapshot?.metaImageUrls ?? [],
+    visibleTags: latestDebugSnapshot?.visibleTags ?? [],
+    hashtags: latestDebugSnapshot?.hashtags ?? [],
+    errors: latestDebugSnapshot?.errors ?? []
+  };
+}
+
+function normalizedHttpUrl(value: string | undefined | null): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    url.hash = "";
+    return url.href;
+  } catch {
+    return undefined;
   }
 }
 
@@ -1333,12 +1527,14 @@ async function importQueueItems(options: { aiAuto: boolean }): Promise<void> {
   await persistSelectedQueueItemEditsNow();
 
   await runImport(async () => {
-    const api = requireConfiguredApi();
     const targets = (currentQueue?.items ?? []).filter(isQueueItemImportable);
     if (!targets.length) {
       setStatus("No queued items need importing.", "info");
       return;
     }
+    const api = requireConfiguredApi({
+      allowSessionAuth: !options.aiAuto && targets.every((item) => Boolean(item.draft.blombooruBooruImport))
+    });
 
     let imported = 0;
     let duplicates = 0;
@@ -1386,7 +1582,9 @@ function isQueueItemImportable(item: ImportQueueItem): boolean {
 
 async function importCurrentQueueItemNoAi(api: BlombooruApi): Promise<void> {
   const payload = buildFinalPayload();
-  const upload = await uploadCurrentMedia(api, payload);
+  const upload = draft.blombooruBooruImport
+    ? await downloadCurrentBooruImport(api, payload)
+    : await uploadCurrentMedia(api, payload);
   markUploaded(upload, { finalSaved: true });
   await persistSelectedQueueItemEditsNow();
   await setQueueItemStatus(requireSelectedQueueItemId(), "imported", "Imported.", upload.link);
@@ -1394,9 +1592,16 @@ async function importCurrentQueueItemNoAi(api: BlombooruApi): Promise<void> {
 
 async function importCurrentQueueItemAiAuto(api: BlombooruApi): Promise<void> {
   const initialPayload = buildFinalPayload();
-  const upload = await uploadCurrentMedia(api, initialPayload);
-  const mediaId = requireMediaId(upload);
-  markUploaded(upload);
+  const initialImport = await importCurrentMediaForAi(api, initialPayload);
+  const upload = initialImport.upload;
+  const mediaId = initialImport.mediaId;
+  markUploaded(upload, { mediaId, finalSaved: initialImport.delegated && !mediaId });
+
+  if (!mediaId) {
+    await persistSelectedQueueItemEditsNow();
+    await setQueueItemStatus(requireSelectedQueueItemId(), "imported", BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE, upload.link);
+    return;
+  }
 
   let predictions: AiTagPrediction[];
   try {
@@ -1644,6 +1849,7 @@ function renderWorkflowState(): void {
 function renderPreview(): void {
   const url = previewUrlCandidates()[0];
   const requestId = ++mediaMetadataRequest;
+  previewFailedUrls = new Set();
   revokePreviewObjectUrl();
   els.preview.replaceChildren();
 
@@ -1682,6 +1888,11 @@ function renderPreviewUrl(url: string, requestId: number): void {
         height: video.videoHeight || undefined
       });
     });
+    video.addEventListener("error", () => {
+      if (requestId !== mediaMetadataRequest) return;
+      if (tryFallbackPreviewUrl(url, requestId)) return;
+      showPreviewLoadFailure(url, requestId, "Video preview failed to load.");
+    }, { once: true });
     els.preview.append(video);
     return;
   }
@@ -1743,6 +1954,7 @@ async function renderImageBlobPreview(url: string, requestId: number): Promise<v
     });
     image.addEventListener("error", () => {
       if (requestId !== mediaMetadataRequest) return;
+      if (tryFallbackPreviewUrl(url, requestId)) return;
       showPreviewLoadFailure(url, requestId, "Preview blob could not be displayed.");
     }, { once: true });
     els.preview.replaceChildren(image);
@@ -1754,11 +1966,26 @@ async function renderImageBlobPreview(url: string, requestId: number): Promise<v
 }
 
 function previewUrlCandidates(): string[] {
+  const delegated = draft.blombooruBooruImport;
+  if (delegated) {
+    return uniqueUrls([
+      ...fullQualityUrlCandidates([delegated.proxyFileUrl, delegated.proxyPreviewUrl]),
+      ...fullQualityUrlCandidates([
+        draft.mediaUrl,
+        delegated.fileUrl,
+        draft.previewUrl,
+        delegated.previewUrl,
+        ...rawMediaUrls(draft.raw)
+      ])
+    ]);
+  }
+
   return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
 }
 
 function tryFallbackPreviewUrl(failedUrl: string, requestId: number): boolean {
-  const fallback = previewUrlCandidates().find((candidate) => candidate !== failedUrl);
+  previewFailedUrls.add(failedUrl);
+  const fallback = previewUrlCandidates().find((candidate) => !previewFailedUrls.has(candidate));
   if (!fallback) return false;
   revokePreviewObjectUrl();
   els.preview.replaceChildren();
@@ -1860,7 +2087,7 @@ function renderMediaMetadata(): void {
 function renderChips(): void {
   const parsed = parseTagsWithHints(els.tags.value);
   const artist = normalizeTag(els.artist.value);
-  const hints = { ...parsed.categoryHints };
+  const hints = { ...booruImportCategoryHints(parsed.tags), ...parsed.categoryHints };
   const normalTags = nonRatingTags(parsed.tags);
   const tags = artist ? mergeTags(normalTags.filter((tag) => tag !== artist), [artist]) : normalTags;
 
@@ -1935,9 +2162,11 @@ function renderSettings(nextSettings: AppSettings): void {
 
 async function importNoAi(): Promise<void> {
   await runImport(async () => {
-    const api = requireConfiguredApi();
+    const api = requireConfiguredApi({ allowSessionAuth: Boolean(draft.blombooruBooruImport) });
     const payload = buildFinalPayload();
-    const upload = await uploadCurrentMedia(api, payload);
+    const upload = draft.blombooruBooruImport
+      ? await downloadCurrentBooruImport(api, payload)
+      : await uploadCurrentMedia(api, payload);
     markUploaded(upload, { finalSaved: true });
     if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", "Imported.", upload.link);
     setSuccess("Imported.", upload.link);
@@ -1948,9 +2177,16 @@ async function importAiAuto(): Promise<void> {
   await runImport(async () => {
     const api = requireConfiguredApi();
     const initialPayload = buildFinalPayload();
-    const upload = await uploadCurrentMedia(api, initialPayload);
-    const mediaId = requireMediaId(upload);
-    markUploaded(upload);
+    const initialImport = await importCurrentMediaForAi(api, initialPayload);
+    const upload = initialImport.upload;
+    const mediaId = initialImport.mediaId;
+    markUploaded(upload, { mediaId, finalSaved: initialImport.delegated && !mediaId });
+
+    if (!mediaId) {
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE, upload.link);
+      setLinkedStatus(BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE, upload.link);
+      return;
+    }
 
     let predictions: AiTagPrediction[];
     try {
@@ -2001,9 +2237,16 @@ async function importAiManual(): Promise<void> {
   await runImport(async () => {
     const api = requireConfiguredApi();
     const initialPayload = buildFinalPayload();
-    const upload = await uploadCurrentMedia(api, initialPayload);
-    const mediaId = requireMediaId(upload);
-    markUploaded(upload);
+    const initialImport = await importCurrentMediaForAi(api, initialPayload);
+    const upload = initialImport.upload;
+    const mediaId = initialImport.mediaId;
+    markUploaded(upload, { mediaId, finalSaved: initialImport.delegated && !mediaId });
+
+    if (!mediaId) {
+      if (selectedQueueItemId) await setQueueItemStatus(selectedQueueItemId, "imported", BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE, upload.link);
+      setLinkedStatus(BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE, upload.link);
+      return;
+    }
 
     let predictions: AiTagPrediction[];
     try {
@@ -2029,6 +2272,23 @@ async function importAiManual(): Promise<void> {
   });
 }
 
+async function importCurrentMediaForAi(
+  api: BlombooruApi,
+  payload: ReturnType<typeof buildFinalPayload>
+): Promise<{ upload: UploadMediaResult; mediaId?: string; delegated: boolean }> {
+  const delegated = Boolean(draft.blombooruBooruImport);
+  const upload = delegated
+    ? await downloadCurrentBooruImport(api, payload)
+    : await uploadCurrentMedia(api, payload);
+  const mediaId = upload.id;
+
+  if (!mediaId && !delegated) {
+    throw new Error("Upload succeeded, but Blombooru did not return a media id.");
+  }
+
+  return { upload, mediaId, delegated };
+}
+
 async function uploadCurrentMedia(
   api: BlombooruApi,
   payload: ReturnType<typeof buildFinalPayload>
@@ -2046,6 +2306,24 @@ async function uploadCurrentMedia(
     rating: payload.rating,
     source: payload.source,
     tags: payload.tags,
+    categoryHints: payload.categoryHints
+  });
+}
+
+async function downloadCurrentBooruImport(
+  api: BlombooruApi,
+  payload: ReturnType<typeof buildFinalPayload>
+): Promise<UploadMediaResult> {
+  const state = draft.blombooruBooruImport;
+  if (!state?.originalUrl) throw new Error("No Blombooru booru import source URL found.");
+
+  setStatus("Importing with Blombooru booru import...", "info");
+  return api.downloadBooruImport({
+    url: state.originalUrl,
+    tags: payload.tags,
+    rating: payload.rating,
+    source: payload.source || state.source || state.booruUrl || state.originalUrl,
+    autoCreateTags: true,
     categoryHints: payload.categoryHints
   });
 }
@@ -2124,7 +2402,7 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
   source: string;
 } {
   const parsed = parseTagsWithHints(els.tags.value);
-  const categoryHints = { ...parsed.categoryHints };
+  const categoryHints = { ...booruImportCategoryHints(parsed.tags), ...parsed.categoryHints };
   const extraTags = extraPredictions.map((prediction) => prediction.name);
   const artist = normalizeTag(els.artist.value);
 
@@ -2150,6 +2428,20 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
     rating: getRating(),
     source: els.source.value.trim()
   };
+}
+
+function booruImportCategoryHints(currentTags: string[]): Record<string, string> {
+  const tagSet = new Set(currentTags.map(normalizeTag).filter(Boolean));
+  const hints: Record<string, string> = {};
+
+  for (const tag of draft.blombooruBooruImport?.tags ?? []) {
+    const name = normalizeTag(tag.name);
+    const category = normalizeCategory(tag.category);
+    if (!name || !tagSet.has(name) || !category || category === "unknown") continue;
+    hints[name] = category;
+  }
+
+  return hints;
 }
 
 function selectAutoPredictions(predictions: AiTagPrediction[]): AiTagPrediction[] {
@@ -2261,7 +2553,7 @@ function rememberPredictionCategories(predictions: AiTagPrediction[]): void {
   }
 }
 
-function requireConfiguredApi(): BlombooruApi {
+function requireConfiguredApi(options: { allowSessionAuth?: boolean } = {}): BlombooruApi {
   settings = normalizeSettings({
     ...settings,
     baseUrl: els.baseUrl.value,
@@ -2275,15 +2567,16 @@ function requireConfiguredApi(): BlombooruApi {
     closeAfterImport: els.closeAfterImport.checked,
     clearPanelAfterImportDefault: els.clearPanelAfterImportDefault.checked,
     misskeyArtistMode: els.misskeyArtistMode.value as AppSettings["misskeyArtistMode"],
+    fourChanTagMode: els.fourChanTagMode.value as AppSettings["fourChanTagMode"],
     sidePanelImageBlurMode: els.sidePanelImageBlurMode.value as AppSettings["sidePanelImageBlurMode"],
     multiAddCaptureLeftClick: els.multiAddCaptureLeftClick.checked,
     multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
   });
 
-  if (!settings.baseUrl || !settings.apiKey) {
+  if (!settings.baseUrl || (!settings.apiKey && !options.allowSessionAuth)) {
     els.settingsPanel.open = true;
-    throw new BlombooruApiError("Missing Blombooru base URL or API key.");
+    throw new BlombooruApiError(options.allowSessionAuth ? "Missing Blombooru base URL." : "Missing Blombooru base URL or API key.");
   }
 
   return new BlombooruApi(settings);
@@ -2343,11 +2636,6 @@ function setBusy(nextBusy: boolean): void {
   ]) {
     button.disabled = nextBusy;
   }
-}
-
-function requireMediaId(upload: UploadMediaResult): string {
-  if (!upload.id) throw new Error("Upload succeeded, but Blombooru did not return a media id.");
-  return upload.id;
 }
 
 function setSuccess(message: string, link?: string, options: { allowClose?: boolean } = {}): void {

@@ -62,6 +62,8 @@ Right-click an image, video, link, post, or page and choose **Add to Blombooru**
 
 The side panel opens with a preview, editable source URL, artist, rating, and a space-separated tag textbox. The source URL is adapter-driven when possible, so Misskey notes and X/Twitter tweets use the nearest post URL instead of a generic feed URL.
 
+When the configured Blombooru instance supports its native booru importer, Boo Check first asks Blombooru to fetch the current post URL through `/api/booru-import/fetch`. A successful response populates the same sidebar fields, previews original media through Blombooru's proxy when available, and delegates download/import to Blombooru. Site adapters are kept as a fallback for unsupported URLs.
+
 Clicked media is preferred when present. For page or empty-space right-clicks, Boo Check records the right-clicked DOM target and uses site adapters plus generic fallbacks to find the most likely media.
 
 Clicking the Boo Check toolbar icon reopens the side panel and restores the most recent side-panel workflow state unless a newer right-click draft exists. Use **Clear Side Panel** to reset the draft, fields, manual suggestions, result popup, and debug snapshot without clearing settings.
@@ -82,7 +84,7 @@ The multi-add settings control whether left-clicks, right-clicks, or both are ca
 - **Import Queue** imports queued items sequentially with their saved fields.
 - **Import Queue + AI Auto** imports queued items sequentially, runs Blombooru AI after each upload, merges selected AI tags with each queued item's existing tags, then patches final tags.
 
-Before upload, Boo Check fetches the media, computes SHA-256 locally with `crypto.subtle.digest`, and renames the file to `<sha256>.<extension>`.
+For Blombooru-native booru drafts, AI import asks Blombooru to download/import first and runs AI only if Blombooru returns a media ID. Before extension-managed uploads, Boo Check fetches the media, computes SHA-256 locally with `crypto.subtle.digest`, and renames the file to `<sha256>.<extension>`.
 
 ## Blombooru archive prep
 
@@ -115,6 +117,7 @@ All endpoint paths are centralized in `src/api/blombooru.ts`:
 - `PATCH /api/media/{media_id}`
 - `GET /api/tags/autocomplete?q=<query>`, with fallback to `query=<query>`
 - Best-effort `POST /api/tags/` for category creation when available
+- Delegated booru import: `POST /api/booru-import/fetch`, `POST /api/booru-import/download`, and optional preview proxy `GET /api/booru-import/proxy-image?url=<url>`
 
 ## Host permissions
 

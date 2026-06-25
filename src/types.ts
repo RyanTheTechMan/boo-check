@@ -17,6 +17,29 @@ export type TagCategory =
   | "unknown"
   | string;
 
+export type BlombooruBooruImportTag = {
+  name: string;
+  category?: TagCategory;
+  isNew?: boolean;
+  userAssigned?: boolean;
+};
+
+export type BlombooruBooruImportDraft = {
+  originalUrl: string;
+  booruUrl?: string;
+  fileUrl?: string;
+  previewUrl?: string;
+  proxyFileUrl?: string;
+  proxyPreviewUrl?: string;
+  filename?: string;
+  width?: number;
+  height?: number;
+  fileSize?: number;
+  source?: string;
+  tags: BlombooruBooruImportTag[];
+  fetchedAt: number;
+};
+
 export type ImportDraft = {
   pageUrl?: string;
   sourceUrl?: string;
@@ -29,6 +52,7 @@ export type ImportDraft = {
   hashtags?: string[];
   seedTags?: string[];
   rating?: Rating;
+  blombooruBooruImport?: BlombooruBooruImportDraft;
   raw?: unknown;
 };
 
@@ -197,6 +221,14 @@ export type ImportDebugSnapshot = {
     photoSwipeOpen?: boolean;
     activePhotoSwipeImage?: DebugElementSummary;
     selectedMediaUrl?: string;
+  };
+  booruImport?: {
+    endpoint?: string;
+    sourceUrl?: string;
+    status?: number;
+    delegated?: boolean;
+    tagCount?: number;
+    error?: string;
   };
   metaImageUrls: string[];
   visibleTags: string[];

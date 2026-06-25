@@ -7,7 +7,10 @@ export const BLOMBOORU_ENDPOINTS = {
   aiPredict: (mediaId: string | number) => `/api/ai-tagger/predict/${encodeURIComponent(String(mediaId))}`,
   tagAutocomplete: "/api/tags/autocomplete",
   tag: (name: string) => `/api/tags/${encodeURIComponent(name)}`,
-  tags: "/api/tags/"
+  tags: "/api/tags/",
+  booruImportFetch: "/api/booru-import/fetch",
+  booruImportDownload: "/api/booru-import/download",
+  booruImportProxyImage: "/api/booru-import/proxy-image"
 };
 
 export type UploadMediaInput = {
@@ -29,6 +32,36 @@ export type PatchMediaInput = {
   rating: Rating;
   source: string;
   categoryHints?: Record<string, string>;
+};
+
+export type BooruImportTag = {
+  name: string;
+  category?: string;
+  isNew?: boolean;
+  userAssigned?: boolean;
+};
+
+export type BooruImportPost = {
+  fileUrl?: string;
+  previewUrl?: string;
+  filename?: string;
+  rating: Rating;
+  source?: string;
+  booruUrl?: string;
+  width?: number;
+  height?: number;
+  fileSize?: number;
+  tags: BooruImportTag[];
+  raw: unknown;
+};
+
+export type DownloadBooruImportInput = {
+  url: string;
+  tags: string[];
+  rating: Rating;
+  source: string;
+  autoCreateTags: boolean;
+  categoryHints: Record<string, string>;
 };
 
 export class BlombooruApiError extends Error {
@@ -62,6 +95,60 @@ export class BlombooruApi {
   private tagCreationUnsupported = false;
 
   constructor(private readonly settings: AppSettings) {}
+
+  booruImportProxyImageUrl(imageUrl: string | undefined): string | undefined {
+    if (!imageUrl || !this.settings.baseUrl) return undefined;
+
+    try {
+      const url = new URL(BLOMBOORU_ENDPOINTS.booruImportProxyImage, `${this.settings.baseUrl}/`);
+      url.searchParams.set("url", imageUrl);
+      return url.href;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async fetchBooruImport(url: string): Promise<BooruImportPost> {
+    const response = await this.fetchRaw(BLOMBOORU_ENDPOINTS.booruImportFetch, {
+      method: "POST",
+      json: { url },
+      authRequired: false,
+      credentials: "include"
+    });
+
+    const raw = await readJsonSafely(response);
+    if (response.status === 401 || response.status === 403) throw new BlombooruAuthError(response.status);
+    if (!response.ok) throw new BlombooruApiError(errorMessageFromRaw(raw, `Booru fetch failed (${response.status}).`), response.status);
+    return normalizeBooruImportPost(raw);
+  }
+
+  async downloadBooruImport(input: DownloadBooruImportInput): Promise<UploadMediaResult> {
+    const response = await this.fetchRaw(BLOMBOORU_ENDPOINTS.booruImportDownload, {
+      method: "POST",
+      json: {
+        url: input.url,
+        tags: input.tags,
+        rating: input.rating,
+        source: input.source,
+        auto_create_tags: input.autoCreateTags,
+        category_hints: input.categoryHints
+      },
+      authRequired: false,
+      credentials: "include"
+    });
+
+    const raw = await readJsonSafely(response);
+    const result = normalizeUploadResult(raw, this.settings.baseUrl);
+    const errorMessage = errorMessageFromRaw(raw, `Booru import failed (${response.status}).`);
+
+    if (response.status === 409 || /duplicate|already exists|already imported/i.test(errorMessage)) {
+      throw new BlombooruDuplicateError(result);
+    }
+    if (response.status === 401 || response.status === 403) throw new BlombooruAuthError(response.status);
+    if (!response.ok) throw new BlombooruApiError(errorMessage, response.status);
+
+    return result;
+  }
 
   async autocomplete(query: string): Promise<TagSuggestion[]> {
     const q = query.trim();
@@ -213,10 +300,12 @@ export class BlombooruApi {
       searchParams?: Record<string, string>;
       json?: unknown;
       body?: BodyInit;
+      authRequired?: boolean;
+      credentials?: RequestCredentials;
     }
   ): Promise<Response> {
     if (!this.settings.baseUrl) throw new BlombooruApiError("Missing Blombooru base URL.");
-    if (!this.settings.apiKey) throw new BlombooruApiError("Missing Blombooru API key.");
+    if (options.authRequired !== false && !this.settings.apiKey) throw new BlombooruApiError("Missing Blombooru API key.");
 
     const url = new URL(path, `${this.settings.baseUrl}/`);
     for (const [key, value] of Object.entries(options.searchParams ?? {})) {
@@ -224,7 +313,9 @@ export class BlombooruApi {
     }
 
     const headers = new Headers();
-    headers.set("Authorization", `Bearer ${this.settings.apiKey}`);
+    if (this.settings.apiKey) {
+      headers.set("Authorization", `Bearer ${this.settings.apiKey}`);
+    }
     if (options.json !== undefined) {
       headers.set("Content-Type", "application/json");
     }
@@ -232,7 +323,8 @@ export class BlombooruApi {
     return fetch(url.href, {
       method: options.method,
       headers,
-      body: options.json !== undefined ? JSON.stringify(options.json) : options.body
+      body: options.json !== undefined ? JSON.stringify(options.json) : options.body,
+      credentials: options.credentials
     });
   }
 }
@@ -263,6 +355,54 @@ function normalizeUploadResult(raw: unknown, baseUrl: string): UploadMediaResult
     link: extractMediaLink(raw, baseUrl, id),
     raw
   };
+}
+
+function normalizeBooruImportPost(raw: unknown): BooruImportPost {
+  const value = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return {
+    fileUrl: stringValue(value.file_url) || stringValue(value.fileUrl),
+    previewUrl: stringValue(value.preview_url) || stringValue(value.previewUrl),
+    filename: stringValue(value.filename) || stringValue(value.file_name) || stringValue(value.fileName),
+    rating: normalizeBooruImportRating(value.rating),
+    source: stringValue(value.source),
+    booruUrl: stringValue(value.booru_url) || stringValue(value.booruUrl) || stringValue(value.post_url) || stringValue(value.postUrl),
+    width: numberValue(value.width),
+    height: numberValue(value.height),
+    fileSize: numberValue(value.file_size) ?? numberValue(value.fileSize),
+    tags: firstArray(value.tags, []).map(parseBooruImportTag).filter((tag): tag is BooruImportTag => Boolean(tag)),
+    raw
+  };
+}
+
+function parseBooruImportTag(item: unknown): BooruImportTag | undefined {
+  if (typeof item === "string") {
+    const name = normalizeTag(item);
+    return name ? { name } : undefined;
+  }
+  if (!item || typeof item !== "object") return undefined;
+
+  const record = item as Record<string, unknown>;
+  const name = normalizeTag(stringValue(record.name) || stringValue(record.tag) || stringValue(record.value));
+  if (!name) return undefined;
+
+  return {
+    name,
+    category: normalizeCategory(stringValue(record.category) || stringValue(record.type)),
+    isNew: booleanValue(record.is_new) ?? booleanValue(record.isNew),
+    userAssigned: booleanValue(record.user_assigned) ?? booleanValue(record.userAssigned)
+  };
+}
+
+function normalizeBooruImportRating(value: unknown): Rating {
+  const normalized = stringValue(value)?.toLowerCase();
+  if (normalized === "explicit" || normalized === "e") return "explicit";
+  if (normalized === "questionable" || normalized === "q" || normalized === "sensitive") return "questionable";
+  return "safe";
+}
+
+function errorMessageFromRaw(raw: unknown, fallback: string): string {
+  const record = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+  return stringValue(record?.detail) || stringValue(record?.message) || stringValue(record?.error) || fallback;
 }
 
 function extractMediaLink(raw: unknown, baseUrl: string, id?: string): string | undefined {
@@ -419,4 +559,13 @@ function stringValue(value: unknown): string | undefined {
 function numberValue(value: unknown): number | undefined {
   const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(number) ? number : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes"].includes(normalized)) return true;
+  if (["false", "0", "no"].includes(normalized)) return false;
+  return undefined;
 }
