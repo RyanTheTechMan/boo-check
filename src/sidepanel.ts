@@ -8,6 +8,8 @@ import {
 } from "./api/blombooru";
 import {
   EXTRACT_PAGE_CONTEXT_MESSAGE,
+  FETCH_PAGE_BOORU_POST_MESSAGE,
+  FETCH_PAGE_MEDIA_MESSAGE,
   IMPORT_QUEUE_STORE_KEY,
   PENDING_IMPORT_KEY,
   SET_MULTI_ADD_AUTO_COLLECT_MESSAGE,
@@ -30,8 +32,9 @@ import type {
   SavedSidePanelState,
   TagSuggestion
 } from "./types";
-import { fetchMediaAsStableFile } from "./utils/hash";
+import { fetchMediaAsStableFile, stableFileFromBlob, type StableFileResult } from "./utils/hash";
 import {
+  commaTagText,
   currentToken,
   isRatingTag,
   mergeTags,
@@ -39,6 +42,7 @@ import {
   normalizePrediction,
   normalizeSuggestion,
   normalizeTag,
+  parseCommaSeparatedTags,
   parseTagsWithHints,
   replaceCurrentToken,
   tagText
@@ -155,13 +159,106 @@ let selectedQueueItemId: string | undefined;
 let previewObjectUrl: string | undefined;
 let previewFailedUrls = new Set<string>();
 
+type BooruImportFetchFailure = {
+  status?: number;
+  error: string;
+  failedAt: number;
+};
+
+type PreviewFailureDetail = {
+  url: string;
+  error: string;
+  status?: number;
+  contentType?: string;
+  responseUrl?: string;
+  bodyPreview?: string;
+  authAttempted?: boolean;
+};
+
+type PageMediaFetchResponse = {
+  ok?: boolean;
+  url?: string;
+  contentType?: string;
+  bytes?: number;
+  base64?: string;
+  error?: string;
+};
+
+type PageBooruPostFetchResponse = {
+  ok?: boolean;
+  url?: string;
+  responseUrl?: string;
+  contentType?: string;
+  bytes?: number;
+  tagCount?: number;
+  mediaUrl?: string;
+  previewUrl?: string;
+  draft?: ImportDraft;
+  error?: string;
+};
+
+type PageContextFetchDetail = {
+  url: string;
+  responseUrl?: string;
+  bytes?: number;
+  contentType?: string;
+  error?: string;
+};
+
+type BooruEnrichmentResult = {
+  fetchedWithBlombooru: boolean;
+  fetchedWithPageBooruPost: boolean;
+  startedPageSessionPostFetch?: boolean;
+};
+
+type BooruImportEnrichOptions = {
+  timeoutMs?: number;
+  cacheFailures?: boolean;
+  strategy?: string;
+};
+
+type BooruMediaStrategy = "blombooru-native" | "page-session" | "generic-booru";
+
+type ArtistLookupCacheEntry = {
+  exists: boolean;
+  category?: string;
+};
+
+type ArtistStatusResult = ArtistLookupCacheEntry & {
+  name: string;
+};
+
+class PreviewResponseError extends Error {
+  readonly detail: Omit<PreviewFailureDetail, "url" | "error">;
+
+  constructor(message: string, detail: Omit<PreviewFailureDetail, "url" | "error">) {
+    super(message);
+    this.name = "PreviewResponseError";
+    this.detail = detail;
+  }
+}
+
+let previewFailureDetails: PreviewFailureDetail[] = [];
+let pageContextFetchDetails: PageContextFetchDetail[] = [];
+const pageContextMediaRequests = new Map<string, Promise<{ url: string; blob: Blob; contentType: string; bytes: number }>>();
+const pageContextMediaCache = new Map<string, { url: string; blob: Blob; contentType: string; bytes: number; cachedAt: number }>();
+const pageBooruPostEnrichmentRequests = new Map<string, Promise<boolean>>();
+
 const autocompleteCache = new Map<string, TagSuggestion[]>();
 const artistAutocompleteCache = new Map<string, TagSuggestion[]>();
 const categoryCache = new Map<string, string>();
+const artistLookupCache = new Map<string, ArtistLookupCacheEntry>();
 const queueMetadataRequests = new Set<string>();
 const removedQueueItemIds = new Set<string>();
 const queueClearCutoffs = new Map<number, number>();
+const booruImportFetchFailures = new Map<string, BooruImportFetchFailure>();
+const booruImportFetchRequests = new Map<string, Promise<BooruImportPost>>();
 const RATING_VALUES: readonly Rating[] = ["safe", "questionable", "explicit"];
+const SIDE_PANEL_DEBUG_BUILD = "booru-strategy-page-session-2026-06-25.10";
+const BOORU_IMPORT_FETCH_FAILURE_TTL_MS = 60_000;
+const BOORU_IMPORT_FETCH_TIMEOUT_MS = 8000;
+const MEDIA_METADATA_FETCH_TIMEOUT_MS = 8000;
+const PREVIEW_LOAD_TIMEOUT_MS = 15000;
 const BOORU_IMPORT_NO_MEDIA_ID_AI_MESSAGE =
   "Imported, but AI tagging cannot run because Blombooru did not return a media id.";
 
@@ -178,10 +275,12 @@ async function init(): Promise<void> {
 
   if (!restored && !restoredQueueItem) {
     applyDraftToForm();
-    renderAll();
     await enrichFromActiveTab();
-    const fetchedWithBlombooru = await enrichFromBlombooruBooruImport();
-    applyDraftToForm({ preserveEditedTags: !fetchedWithBlombooru });
+    applyDraftToForm({ preserveEditedTags: true });
+    renderAll();
+    const { fetchedWithBlombooru, fetchedWithPageBooruPost } = await enrichFromBooruSources();
+    if (!fetchedWithBlombooru && !fetchedWithPageBooruPost) applyFallbackBooruProxyMedia();
+    applyDraftToForm({ preserveEditedTags: !(fetchedWithBlombooru || fetchedWithPageBooruPost) });
     renderAll();
   } else {
     renderQueue();
@@ -263,6 +362,7 @@ function bindEvents(): void {
       const nextPending = changes[PENDING_IMPORT_KEY].newValue as PendingImport | undefined;
       if (!nextPending?.draft) return;
       const isNewPending = nextPending.createdAt !== pendingCreatedAt || nextPending.tabId !== pendingTabId;
+      if (!isNewPending && shouldIgnoreSamePendingDraftUpdate(nextPending.draft)) return;
       selectedQueueItemId = undefined;
       draft = nextPending.draft;
       pendingTabId = nextPending.tabId;
@@ -275,11 +375,14 @@ function bindEvents(): void {
       renderQueue();
       hideSuccessPopup();
       void enrichFromActiveTab().then(async () => {
-        const fetchedWithBlombooru = await enrichFromBlombooruBooruImport();
-        applyDraftToForm({ preserveEditedTags: !fetchedWithBlombooru });
+        applyDraftToForm({ preserveEditedTags: !isNewPending });
+        renderAll();
+        const { fetchedWithBlombooru, fetchedWithPageBooruPost } = await enrichFromBooruSources();
+        if (!fetchedWithBlombooru && !fetchedWithPageBooruPost) applyFallbackBooruProxyMedia();
+        applyDraftToForm({ preserveEditedTags: !isNewPending && !(fetchedWithBlombooru || fetchedWithPageBooruPost) });
         renderAll();
         renderDebugPanel();
-        if (!fetchedWithBlombooru) setStatus("Loaded new context-menu draft.", "info");
+        if (!fetchedWithBlombooru && !fetchedWithPageBooruPost) setStatus("Loaded new context-menu draft.", "info");
         persistSidePanelStateDebounced();
       });
     }
@@ -350,10 +453,11 @@ function restoreSavedSidePanelState(saved: SavedSidePanelState): void {
   pendingTabId = saved.tabId;
   pendingCreatedAt = saved.pendingCreatedAt ?? 0;
   latestDebugSnapshot = saved.debug;
+  applyFallbackBooruProxyMedia();
   uploadedState = saved.uploaded;
 
   els.source.value = saved.form?.source ?? draft.sourceUrl ?? draft.pageUrl ?? "";
-  els.artist.value = saved.form?.artist ?? draft.artistTag ?? "";
+  els.artist.value = saved.form?.artist ?? commaTagText(draftArtistTags(draft));
   setRating(saved.form?.rating ?? draft.rating ?? settings.defaultRating);
   els.includeHashtags.checked = saved.form?.includePostHashtags ?? settings.includePostHashtagsDefault;
   els.tags.value = saved.form?.tags ?? "";
@@ -382,6 +486,33 @@ function restoreSavedSidePanelState(saved: SavedSidePanelState): void {
     });
     els.successTitle.textContent = saved.success.title;
   }
+}
+
+function shouldIgnoreSamePendingDraftUpdate(nextDraft: ImportDraft): boolean {
+  if (nextDraft.blombooruBooruImport) return false;
+  const currentPostUrl = firstBooruPostFetchUrl(draft);
+  const nextPostUrl = firstBooruPostFetchUrl(nextDraft);
+  if (currentPostUrl && nextPostUrl && normalizedQueueUrlKey(currentPostUrl) !== normalizedQueueUrlKey(nextPostUrl)) {
+    return false;
+  }
+
+  updateBooruImportDebug({
+    delegated: false,
+    fetchStrategy: latestDebugSnapshot?.booruImport?.fetchStrategy,
+    ignoredPendingUpdateReason: "same-pending-background-enrichment-ignored"
+  });
+  renderDebugPanel();
+  return true;
+}
+
+function firstBooruPostFetchUrl(nextDraft: ImportDraft): string | undefined {
+  return [
+    nextDraft.sourceUrl,
+    ...rawBooruImportCandidateUrls(nextDraft.raw),
+    nextDraft.pageUrl
+  ]
+    .map(canonicalBooruImportFetchUrl)
+    .find((url): url is string => Boolean(url && looksLikeBooruPostFetchUrl(url)));
 }
 
 function buildSavedSidePanelState(): SavedSidePanelState {
@@ -507,8 +638,105 @@ async function enrichFromActiveTab(): Promise<void> {
   }
 }
 
-async function enrichFromBlombooruBooruImport(): Promise<boolean> {
+async function enrichFromBooruSources(): Promise<BooruEnrichmentResult> {
+  const mediaStrategy = booruMediaStrategy(draft);
+  if (mediaStrategy === "page-session") {
+    const started = startPageSessionBooruPostEnrichment("page-session-background");
+    updateBooruImportDebug({
+      delegated: false,
+      mediaStrategy,
+      fetchStrategy: "page-session-background",
+      blombooruFetchSkippedReason: "page-session-media-strategy",
+      proxySkippedReason: "page-session-media-strategy",
+      fallbackProxyApplied: false,
+      fallbackProxyReason: "page-session-media-strategy"
+    });
+    return {
+      fetchedWithBlombooru: false,
+      fetchedWithPageBooruPost: false,
+      startedPageSessionPostFetch: started
+    };
+  }
+
+  const fetchedWithBlombooru = await enrichFromBlombooruBooruImport({
+    timeoutMs: BOORU_IMPORT_FETCH_TIMEOUT_MS,
+    cacheFailures: true,
+    strategy: "normal"
+  });
+  const fetchedWithPageBooruPost = !fetchedWithBlombooru && await enrichFromPageBooruPostFallback("normal-fallback");
+  return { fetchedWithBlombooru, fetchedWithPageBooruPost };
+}
+
+function startPageSessionBooruPostEnrichment(strategy = "page-session-background"): boolean {
+  if (booruMediaStrategy(draft) !== "page-session") return false;
+
+  const candidate = pageBooruPostFallbackCandidates()[0];
+  if (!candidate) return false;
+
+  const requestKey = normalizedQueueUrlKey(candidate) || candidate;
+  if (pageBooruPostEnrichmentRequests.has(requestKey)) return true;
+
+  const startedForm = currentFormState();
+  const startedPreviewUrl = previewUrlCandidates()[0];
+  const request = enrichFromPageBooruPostFallback(strategy)
+    .then(async (fetched) => {
+      if (!fetched) return false;
+      const nextPreviewUrl = previewUrlCandidates()[0];
+      if (nextPreviewUrl && nextPreviewUrl !== startedPreviewUrl) {
+        await preloadPageSessionPreview(nextPreviewUrl);
+      }
+      const tagsWereEdited = els.tags.value.trim() !== startedForm.tags.trim();
+      applyDraftToForm({ preserveEditedTags: tagsWereEdited });
+      renderAll();
+      persistSidePanelStateDebounced();
+      return true;
+    })
+    .finally(() => {
+      pageBooruPostEnrichmentRequests.delete(requestKey);
+    });
+
+  pageBooruPostEnrichmentRequests.set(requestKey, request);
+  void request;
+  return true;
+}
+
+async function preloadPageSessionPreview(url: string): Promise<void> {
+  if (!shouldPreferPageContextMediaFetch(url)) return;
+  const rawUrl = pageMediaUrlForCandidate(url);
+  if (!rawUrl) return;
+
+  try {
+    await fetchPageContextMediaBlob(rawUrl);
+  } catch {
+    // Preview rendering will report the failure if this candidate is still selected.
+  }
+}
+
+function booruMediaStrategy(nextDraft: ImportDraft): BooruMediaStrategy | undefined {
+  if (nextDraft.blombooruBooruImport) return "blombooru-native";
+  if (nextDraft.site !== "booru") return undefined;
+  return hasPageSessionBooruEvidence(nextDraft) ? "page-session" : "generic-booru";
+}
+
+function hasPageSessionBooruEvidence(nextDraft: ImportDraft): boolean {
+  return isPageSessionBooruDraft(nextDraft) ||
+    Boolean(firstBooruPostFetchUrl(nextDraft)) ||
+    rawFallbackBooruMediaCandidates(nextDraft).length > 0;
+}
+
+async function enrichFromBlombooruBooruImport(options: BooruImportEnrichOptions = {}): Promise<boolean> {
   if (!settings.baseUrl) return false;
+  const mediaStrategy = booruMediaStrategy(draft);
+  if (mediaStrategy === "page-session") {
+    updateBooruImportDebug({
+      delegated: false,
+      mediaStrategy,
+      fetchStrategy: options.strategy,
+      blombooruFetchSkippedReason: "page-session-media-strategy",
+      error: undefined
+    });
+    return false;
+  }
 
   const candidates = await booruImportUrlCandidates();
   if (!candidates.length) return false;
@@ -522,15 +750,45 @@ async function enrichFromBlombooruBooruImport(): Promise<boolean> {
   let lastError: unknown;
 
   for (const candidate of candidates) {
+    const cachedFailure = booruImportFetchFailure(candidate);
+    if (cachedFailure) {
+      lastError = new BlombooruApiError(cachedFailure.error, cachedFailure.status);
+      updateBooruImportDebug({
+        endpoint: "/api/booru-import/fetch",
+        sourceUrl: candidate,
+        status: cachedFailure.status,
+        delegated: false,
+        fetchStrategy: options.strategy,
+        blombooruFetchTimeoutMs: options.timeoutMs,
+        tagCount: undefined,
+        proxyFileUrl: undefined,
+        proxyPreviewUrl: undefined,
+        selectedPreviewUrl: undefined,
+        mediaValidationRejectedUrl: undefined,
+        mediaValidationError: undefined,
+        error: cachedFailure.error
+      });
+      continue;
+    }
+
     try {
-      const post = await api.fetchBooruImport(candidate);
+      const post = await fetchBooruImportWithDedupe(api, candidate, options);
       draft = mergeDrafts(draft, draftFromBlombooruBooruPost(candidate, post, api));
       rememberBooruImportCategories(post);
       updateBooruImportDebug({
         endpoint: "/api/booru-import/fetch",
         sourceUrl: candidate,
+        status: undefined,
         delegated: true,
-        tagCount: post.tags.length
+        fetchStrategy: options.strategy,
+        blombooruFetchTimeoutMs: options.timeoutMs,
+        blombooruFetchFallbackReason: undefined,
+        tagCount: post.tags.length,
+        proxyFileUrl: draft.blombooruBooruImport?.proxyFileUrl,
+        proxyPreviewUrl: draft.blombooruBooruImport?.proxyPreviewUrl,
+        mediaValidationRejectedUrl: undefined,
+        mediaValidationError: undefined,
+        error: undefined
       });
       setStatus("Fetched with Blombooru booru import.", "success");
       return true;
@@ -540,6 +798,15 @@ async function enrichFromBlombooruBooruImport(): Promise<boolean> {
         endpoint: "/api/booru-import/fetch",
         sourceUrl: candidate,
         status: error instanceof BlombooruApiError ? error.status : undefined,
+        delegated: false,
+        fetchStrategy: options.strategy,
+        blombooruFetchTimeoutMs: options.timeoutMs,
+        tagCount: undefined,
+        proxyFileUrl: undefined,
+        proxyPreviewUrl: undefined,
+        selectedPreviewUrl: undefined,
+        mediaValidationRejectedUrl: undefined,
+        mediaValidationError: undefined,
         error: error instanceof Error ? error.message : "Booru fetch failed."
       });
       if (error instanceof BlombooruAuthError) break;
@@ -550,10 +817,54 @@ async function enrichFromBlombooruBooruImport(): Promise<boolean> {
   return false;
 }
 
+function booruImportFetchFailure(candidate: string): BooruImportFetchFailure | undefined {
+  const failure = booruImportFetchFailures.get(candidate);
+  if (!failure) return undefined;
+
+  if (Date.now() - failure.failedAt > BOORU_IMPORT_FETCH_FAILURE_TTL_MS) {
+    booruImportFetchFailures.delete(candidate);
+    return undefined;
+  }
+
+  return failure;
+}
+
+async function fetchBooruImportWithDedupe(
+  api: BlombooruApi,
+  candidate: string,
+  options: BooruImportEnrichOptions = {}
+): Promise<BooruImportPost> {
+  const requestKey = `${candidate}::${options.timeoutMs ?? BOORU_IMPORT_FETCH_TIMEOUT_MS}`;
+  const inFlight = booruImportFetchRequests.get(requestKey);
+  if (inFlight) return inFlight;
+
+  const request = api.fetchBooruImport(candidate, { timeoutMs: options.timeoutMs ?? BOORU_IMPORT_FETCH_TIMEOUT_MS })
+    .then((post) => {
+      booruImportFetchFailures.delete(candidate);
+      return post;
+    })
+    .catch((error) => {
+      if (options.cacheFailures !== false) {
+        booruImportFetchFailures.set(candidate, {
+          status: error instanceof BlombooruApiError ? error.status : undefined,
+          error: error instanceof Error ? error.message : "Booru fetch failed.",
+          failedAt: Date.now()
+        });
+      }
+      throw error;
+    })
+    .finally(() => {
+      booruImportFetchRequests.delete(requestKey);
+    });
+
+  booruImportFetchRequests.set(requestKey, request);
+  return request;
+}
+
 async function booruImportUrlCandidates(): Promise<string[]> {
   const candidates: string[] = [];
   const add = (value: string | undefined | null): void => {
-    const url = normalizedHttpUrl(value);
+    const url = canonicalBooruImportFetchUrl(value);
     if (url) candidates.push(url);
   };
 
@@ -562,7 +873,134 @@ async function booruImportUrlCandidates(): Promise<string[]> {
   for (const url of rawBooruImportCandidateUrls(draft.raw)) add(url);
   add((await activeTabUrl()) ?? undefined);
 
+  const unique = uniqueUrls(candidates);
+  const postCandidates = unique.filter(looksLikeBooruPostFetchUrl);
+  return postCandidates.length ? postCandidates : unique;
+}
+
+async function enrichFromPageBooruPostFallback(strategy = "normal-fallback"): Promise<boolean> {
+  if (draft.site !== "booru" || draft.blombooruBooruImport) return false;
+
+  const candidates = pageBooruPostFallbackCandidates();
+  if (!candidates.length) return false;
+
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      const post = await fetchPageBooruPost(candidate);
+      if (!post.draft) throw new Error("Page booru post fetch returned no draft.");
+      if (!post.draft.mediaUrl && !post.draft.previewUrl && !post.draft.seedTags?.length) {
+        throw new Error("Page booru post fetch returned no media or tags.");
+      }
+      draft = mergeDrafts(draft, post.draft);
+      updateBooruImportDebug({
+        delegated: false,
+        mediaStrategy: booruMediaStrategy(draft),
+        fetchStrategy: strategy,
+        pagePostFetchUrl: candidate,
+        pagePostFetchResponseUrl: post.responseUrl,
+        pagePostFetchBytes: post.bytes,
+        pagePostFetchContentType: post.contentType,
+        pagePostFetchTagCount: post.tagCount ?? post.draft.seedTags?.length,
+        pagePostFetchMediaUrl: post.mediaUrl ?? post.draft.mediaUrl,
+        pagePostFetchPreviewUrl: post.previewUrl ?? post.draft.previewUrl,
+        pagePostFetchSourceUrl: post.draft.sourceUrl,
+        pagePostFetchArtistTag: post.draft.artistTag,
+        pagePostFetchArtistTags: post.draft.artistTags,
+        pagePostFetchError: undefined,
+        fallbackProxyApplied: false,
+        fallbackProxyReason: "page-session-post-fallback-used",
+        mediaValidationRejectedUrl: undefined,
+        mediaValidationError: undefined
+      });
+      setStatus("Fetched booru post through page session.", "success");
+      return true;
+    } catch (error) {
+      lastError = error;
+      updateBooruImportDebug({
+        delegated: false,
+        mediaStrategy: booruMediaStrategy(draft),
+        fetchStrategy: strategy,
+        pagePostFetchUrl: candidate,
+        pagePostFetchError: error instanceof Error ? error.message : "Page booru post fetch failed."
+      });
+    }
+  }
+
+  if (lastError) renderDebugPanel();
+  return false;
+}
+
+function pageBooruPostFallbackCandidates(): string[] {
+  return pageBooruPostFallbackCandidatesForDraft(draft);
+}
+
+function pageBooruPostFallbackCandidatesForDraft(nextDraft: ImportDraft): string[] {
+  const candidates = [
+    nextDraft.sourceUrl,
+    ...rawBooruImportCandidateUrls(nextDraft.raw),
+    nextDraft.pageUrl
+  ]
+    .map(canonicalBooruImportFetchUrl)
+    .filter((url): url is string => Boolean(url && looksLikeBooruPostFetchUrl(url)));
+
   return uniqueUrls(candidates);
+}
+
+async function fetchPageBooruPost(url: string): Promise<PageBooruPostFetchResponse> {
+  const tabId = pendingTabId ?? (await currentTabId());
+  if (typeof tabId !== "number") throw new Error("No page tab available for booru post fetch.");
+
+  let response: PageBooruPostFetchResponse | undefined;
+  try {
+    response = await chrome.tabs.sendMessage(tabId, {
+      type: FETCH_PAGE_BOORU_POST_MESSAGE,
+      url
+    }) as PageBooruPostFetchResponse | undefined;
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Page booru post fetch message failed.");
+  }
+
+  if (!response?.ok) throw new Error(response?.error || "Page booru post fetch failed.");
+  return response;
+}
+
+function canonicalBooruImportFetchUrl(value: string | undefined | null): string | undefined {
+  const normalized = normalizedHttpUrl(value);
+  if (!normalized) return undefined;
+
+  try {
+    const url = new URL(normalized);
+    if (/\/posts?\/\d+\/?$/i.test(url.pathname) || /\/post\/show\/\d+\/?$/i.test(url.pathname)) {
+      url.search = "";
+      return url.href;
+    }
+
+    const id = url.searchParams.get("id");
+    if (id && /^\d+$/.test(id)) {
+      const canonical = new URL(`${url.origin}${url.pathname}`);
+      for (const key of ["page", "s", "id"]) {
+        const param = url.searchParams.get(key);
+        if (param) canonical.searchParams.set(key, param);
+      }
+      return canonical.href;
+    }
+
+    return normalized;
+  } catch {
+    return normalized;
+  }
+}
+
+function looksLikeBooruPostFetchUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /\/posts?\/\d+\/?$/i.test(url.pathname) ||
+      /\/post\/show\/\d+\/?$/i.test(url.pathname) ||
+      Boolean(url.searchParams.get("id")?.match(/^\d+$/));
+  } catch {
+    return false;
+  }
 }
 
 async function activeTabUrl(): Promise<string | undefined> {
@@ -593,7 +1031,9 @@ function rawBooruImportCandidateUrls(raw: unknown): string[] {
 
 function draftFromBlombooruBooruPost(originalUrl: string, post: BooruImportPost, api: BlombooruApi): ImportDraft {
   const tags = post.tags.map((tag) => normalizeTag(tag.name)).filter(Boolean);
-  const artistTag = post.tags.find((tag) => normalizeCategory(tag.category) === "artist")?.name;
+  const artistTags = mergeTags(post.tags
+    .filter((tag) => normalizeCategory(tag.category) === "artist")
+    .map((tag) => tag.name));
   const sourceUrl = booruImportSourceUrl(originalUrl, post);
   const previewUrl = post.previewUrl || post.fileUrl;
   const proxyPreviewUrl = api.booruImportProxyImageUrl(previewUrl);
@@ -605,7 +1045,8 @@ function draftFromBlombooruBooruPost(originalUrl: string, post: BooruImportPost,
     sourceUrl,
     mediaUrl: post.fileUrl || draft.mediaUrl,
     previewUrl: proxyFileUrl || proxyPreviewUrl || post.fileUrl || previewUrl || draft.previewUrl,
-    artistTag: normalizeTag(artistTag),
+    artistTag: artistTags[0],
+    artistTags,
     seedTags: tags,
     rating: post.rating,
     blombooruBooruImport: {
@@ -642,6 +1083,47 @@ function draftFromBlombooruBooruPost(originalUrl: string, post: BooruImportPost,
   };
 }
 
+function applyFallbackBooruProxyMedia(): boolean {
+  if (draft.site !== "booru") {
+    recordFallbackBooruProxyDecision(false, "not-booru");
+    return false;
+  }
+  const mediaStrategy = booruMediaStrategy(draft);
+  if (mediaStrategy === "blombooru-native") {
+    recordFallbackBooruProxyDecision(false, "already-delegated");
+    return false;
+  }
+  recordFallbackBooruProxyDecision(false, "proxy-only-for-delegated-native");
+  return false;
+}
+
+function recordFallbackBooruProxyDecision(
+  applied: boolean,
+  reason: string,
+  rawCandidates: string[] = [],
+  proxyCandidates: string[] = [],
+  proxyFileUrl?: string,
+  proxyPreviewUrl?: string,
+  selectedPreviewUrl?: string
+): void {
+  if (draft.site !== "booru" && !draft.blombooruBooruImport && reason === "not-booru") return;
+
+  updateBooruImportDebug({
+    delegated: Boolean(draft.blombooruBooruImport),
+    mediaStrategy: booruMediaStrategy(draft),
+    fallbackProxyApplied: applied,
+    fallbackProxyReason: reason,
+    proxySkippedReason: applied ? undefined : reason,
+    fallbackProxyRawCandidates: rawCandidates,
+    fallbackProxyCandidates: proxyCandidates,
+    proxyFileUrl,
+    proxyPreviewUrl,
+    selectedPreviewUrl,
+    mediaValidationRejectedUrl: applied ? undefined : latestDebugSnapshot?.booruImport?.mediaValidationRejectedUrl,
+    mediaValidationError: applied ? undefined : latestDebugSnapshot?.booruImport?.mediaValidationError
+  });
+}
+
 function booruImportSourceUrl(originalUrl: string, post: BooruImportPost): string {
   return normalizedHttpUrl(post.source) || post.booruUrl || originalUrl;
 }
@@ -670,7 +1152,7 @@ function updateBooruImportDebug(next: NonNullable<ImportDebugSnapshot["booruImpo
     selectionNotes: latestDebugSnapshot?.selectionNotes,
     x: latestDebugSnapshot?.x,
     misskey: latestDebugSnapshot?.misskey,
-    booruImport: next,
+    booruImport: { ...latestDebugSnapshot?.booruImport, ...next },
     metaImageUrls: latestDebugSnapshot?.metaImageUrls ?? [],
     visibleTags: latestDebugSnapshot?.visibleTags ?? [],
     hashtags: latestDebugSnapshot?.hashtags ?? [],
@@ -924,8 +1406,12 @@ async function loadQueueItem(
   pendingTabId = currentQueue.tabId;
   pendingCreatedAt = 0;
   latestDebugSnapshot = item.debug;
+  applyFallbackBooruProxyMedia();
   uploadedState = item.uploaded;
   mediaMetadata = item.mediaMetadata;
+  if (mediaMetadata?.url && !previewUrlCandidatesForDraft(draft).includes(mediaMetadata.url)) {
+    mediaMetadata = undefined;
+  }
   mediaMetadataRequest += 1;
   applyFormState(item.form ?? defaultFormForDraft(item.draft));
 
@@ -1313,7 +1799,7 @@ function scrollSelectedQueueItemIntoView(): void {
 }
 
 function queueThumb(item: ImportQueueItem): HTMLElement {
-  const url = item.draft.previewUrl || item.draft.mediaUrl;
+  const url = previewUrlCandidatesForDraft(item.draft)[0];
   const thumb = document.createElement("span");
   thumb.className = "queue-thumb";
 
@@ -1419,27 +1905,30 @@ async function hydrateQueueItemMetadata(itemId: string): Promise<void> {
 }
 
 function metadataUrlCandidatesForItem(item: ImportQueueItem): string[] {
-  return fullQualityUrlCandidates([item.draft.mediaUrl, item.draft.previewUrl, ...rawMediaUrls(item.draft.raw)]);
+  return previewUrlCandidatesForDraft(item.draft);
 }
 
 async function probeMediaMetadata(url: string): Promise<MediaMetadata> {
   const metadata: MediaMetadata = { url, loading: false };
+  let blockedMimeType: string | undefined;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "HEAD",
       credentials: "include",
       referrerPolicy: "no-referrer"
-    });
+    }, MEDIA_METADATA_FETCH_TIMEOUT_MS);
     if (!response.ok) throw new Error(`HEAD ${response.status}`);
     const contentLength = response.headers.get("content-length");
     const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
     metadata.bytes = contentLength ? Number(contentLength) || undefined : undefined;
     metadata.mimeType = contentType || undefined;
+    blockedMimeType = contentType && isClearlyNonMediaMime(contentType) ? contentType : undefined;
     metadata.sizeSource = contentLength ? "head" : undefined;
   } catch {
     // Some hosts do not support HEAD. Image/video probing below can still succeed.
   }
+  if (blockedMimeType) throw new Error(`Media URL returned ${blockedMimeType}.`);
 
   try {
     const dimensions = isVideoUrl(url) ? await loadVideoDimensions(url) : await loadImageDimensions(url);
@@ -1453,17 +1942,22 @@ async function probeMediaMetadata(url: string): Promise<MediaMetadata> {
   if (metadata.width && metadata.height && metadata.bytes) return metadata;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       credentials: "include",
       referrerPolicy: "no-referrer"
-    });
+    }, MEDIA_METADATA_FETCH_TIMEOUT_MS);
     if (!response.ok) throw new Error(`Metadata fetch failed (${response.status}).`);
     const blob = await response.blob();
+    const contentType = normalizedMimeType(blob.type || response.headers.get("content-type") || metadata.mimeType);
+    if (contentType && isClearlyNonMediaMime(contentType)) {
+      blockedMimeType = contentType;
+      throw new Error(`Media URL returned ${contentType}.`);
+    }
     metadata.bytes = blob.size || metadata.bytes;
-    metadata.mimeType = blob.type || metadata.mimeType;
+    metadata.mimeType = contentType || metadata.mimeType;
     metadata.sizeSource = "blob";
 
-    if (blob.type.startsWith("image/")) {
+    if (contentType.startsWith("image/")) {
       const objectUrl = URL.createObjectURL(blob);
       try {
         const dimensions = await loadImageDimensions(objectUrl);
@@ -1474,6 +1968,7 @@ async function probeMediaMetadata(url: string): Promise<MediaMetadata> {
       }
     }
   } catch (error) {
+    if (blockedMimeType) throw error;
     if (metadata.width || metadata.height || metadata.bytes) {
       metadata.sizeProbeFailed = !metadata.bytes;
       return metadata;
@@ -1488,11 +1983,21 @@ async function probeMediaMetadata(url: string): Promise<MediaMetadata> {
 function loadImageDimensions(url: string): Promise<{ width?: number; height?: number }> {
   return new Promise((resolve, reject) => {
     const image = new Image();
-    image.onload = () => resolve({
-      width: image.naturalWidth || undefined,
-      height: image.naturalHeight || undefined
-    });
-    image.onerror = () => reject(new Error("Image metadata failed."));
+    const timeout = window.setTimeout(() => {
+      image.src = "";
+      reject(new Error("Image metadata timed out."));
+    }, MEDIA_METADATA_FETCH_TIMEOUT_MS);
+    image.onload = () => {
+      window.clearTimeout(timeout);
+      resolve({
+        width: image.naturalWidth || undefined,
+        height: image.naturalHeight || undefined
+      });
+    };
+    image.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error("Image metadata failed."));
+    };
     image.src = url;
   });
 }
@@ -1500,12 +2005,22 @@ function loadImageDimensions(url: string): Promise<{ width?: number; height?: nu
 function loadVideoDimensions(url: string): Promise<{ width?: number; height?: number }> {
   return new Promise((resolve, reject) => {
     const video = document.createElement("video");
+    const timeout = window.setTimeout(() => {
+      video.src = "";
+      reject(new Error("Video metadata timed out."));
+    }, MEDIA_METADATA_FETCH_TIMEOUT_MS);
     video.preload = "metadata";
-    video.onloadedmetadata = () => resolve({
-      width: video.videoWidth || undefined,
-      height: video.videoHeight || undefined
-    });
-    video.onerror = () => reject(new Error("Video metadata failed."));
+    video.onloadedmetadata = () => {
+      window.clearTimeout(timeout);
+      resolve({
+        width: video.videoWidth || undefined,
+        height: video.videoHeight || undefined
+      });
+    };
+    video.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error("Video metadata failed."));
+    };
     video.src = url;
   });
 }
@@ -1682,9 +2197,12 @@ function queueImportErrorMessage(error: unknown): string {
 }
 
 function mergeDrafts(base: ImportDraft, extracted: ImportDraft): ImportDraft {
+  const artistTags = draftArtistTags(base, extracted);
   return {
     ...base,
     ...definedOnly(extracted),
+    artistTags: artistTags.length ? artistTags : undefined,
+    artistTag: artistTags[0] || extracted.artistTag || base.artistTag,
     seedTags: mergeTags(base.seedTags, extracted.seedTags),
     hashtags: mergeTags(base.hashtags, extracted.hashtags),
     raw: { base: base.raw, extracted: extracted.raw }
@@ -1712,9 +2230,10 @@ function applyDraftToForm(options: { preserveEditedTags?: boolean } = {}): void 
 
 function defaultFormForDraft(nextDraft: ImportDraft, includeHashtags = settings.includePostHashtagsDefault): ImportFormState {
   const misskeyArtist = misskeyArtistFormValues(nextDraft);
+  const artists = misskeyArtist.artist ? [misskeyArtist.artist] : draftArtistTags(nextDraft);
   return {
     source: nextDraft.sourceUrl || nextDraft.pageUrl || "",
-    artist: misskeyArtist.artist || nextDraft.artistTag || "",
+    artist: commaTagText(artists),
     rating: nextDraft.rating ?? settings.defaultRating,
     tags: tagText(nonRatingTags(defaultTagListForDraft(nextDraft, includeHashtags, misskeyArtist.domainTag))),
     includePostHashtags: includeHashtags
@@ -1751,7 +2270,11 @@ function defaultTagListForDraft(nextDraft: ImportDraft, includeHashtags: boolean
 
 function nonHashtagSeedTags(nextDraft = draft): string[] {
   const hashtags = new Set(normalizedDraftHashtags(nextDraft));
-  return (nextDraft.seedTags ?? []).filter((tag) => !hashtags.has(normalizeTag(tag)));
+  const artists = new Set(draftArtistTags(nextDraft));
+  return (nextDraft.seedTags ?? []).filter((tag) => {
+    const normalized = normalizeTag(tag);
+    return !hashtags.has(normalized) && !artists.has(normalized);
+  });
 }
 
 function normalizedDraftHashtags(nextDraft = draft): string[] {
@@ -1769,7 +2292,7 @@ function syncHashtagTagsWithToggle(): void {
 }
 
 function misskeyArtistFormValues(nextDraft: ImportDraft): { artist?: string; domainTag?: string } {
-  if (nextDraft.site !== "misskey") return { artist: nextDraft.artistTag };
+  if (nextDraft.site !== "misskey") return { artist: undefined };
 
   const rawArtist = (nextDraft.posterName || nextDraft.artistTag || "").trim().replace(/^@+/, "");
   if (!rawArtist) return {};
@@ -1791,6 +2314,13 @@ function misskeyArtistFormValues(nextDraft: ImportDraft): { artist?: string; dom
   }
 
   return { artist: fullArtist || artistOnly };
+}
+
+function draftArtistTags(...drafts: ImportDraft[]): string[] {
+  return mergeTags(...drafts.map((nextDraft) => [
+    ...(nextDraft.artistTags ?? []),
+    nextDraft.artistTag
+  ]));
 }
 
 function splitMisskeyHandle(value: string): { username: string; domain?: string } {
@@ -1847,11 +2377,20 @@ function renderWorkflowState(): void {
 }
 
 function renderPreview(): void {
-  const url = previewUrlCandidates()[0];
+  const candidates = previewUrlCandidates();
+  const url = candidates[0];
   const requestId = ++mediaMetadataRequest;
+  if (url && canReuseRenderedPreview(url)) {
+    recordSelectedBooruPreviewUrl(url, true);
+    return;
+  }
+
   previewFailedUrls = new Set();
+  previewFailureDetails = [];
+  pageContextFetchDetails = [];
   revokePreviewObjectUrl();
   els.preview.replaceChildren();
+  recordPreviewCandidateDebug(candidates, url);
 
   if (!url) {
     mediaMetadata = undefined;
@@ -1870,44 +2409,145 @@ function renderPreview(): void {
   } else {
     resetMediaMetadata(url);
   }
-  void fetchHeadMediaMetadata(url, requestId);
+  recordSelectedBooruPreviewUrl(url);
+  if (!shouldPreferPageContextMediaFetch(url)) {
+    void fetchHeadMediaMetadata(url, requestId);
+  }
 
   renderPreviewUrl(url, requestId);
 }
 
+function canReuseRenderedPreview(url: string): boolean {
+  if (mediaMetadata?.url !== url || mediaMetadata.loading || mediaMetadata.error) return false;
+
+  const image = els.preview.querySelector<HTMLImageElement>("img");
+  if (image && previewObjectUrl && image.src === previewObjectUrl) return true;
+  if (image?.src === url) return true;
+
+  const video = els.preview.querySelector<HTMLVideoElement>("video");
+  return Boolean(video && (video.currentSrc === url || video.src === url));
+}
+
+function recordPreviewCandidateDebug(candidates: string[], selectedUrl: string | undefined): void {
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return;
+
+  updateBooruImportDebug({
+    delegated: Boolean(draft.blombooruBooruImport),
+    mediaStrategy: booruMediaStrategy(draft),
+    previewCandidates: candidates,
+    selectedPreviewUrl: selectedUrl,
+    previewReused: false,
+    previewFailures: [],
+    pageContextFetchUrl: undefined,
+    pageContextFetchResponseUrl: undefined,
+    pageContextFetchBytes: undefined,
+    pageContextFetchContentType: undefined,
+    pageContextFetchError: undefined,
+    pageContextFetches: []
+  });
+  renderDebugPanel();
+}
+
 function renderPreviewUrl(url: string, requestId: number): void {
+  if (shouldUsePageSessionBooruMedia(draft) && !isBooruProxyImageUrl(url)) {
+    void renderPageContextPreviewFirst(url, requestId);
+    return;
+  }
+
   if (isVideoUrl(url)) {
     const video = document.createElement("video");
+    const timeout = window.setTimeout(() => {
+      if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+      if (tryFallbackPreviewUrl(url, requestId, "Video preview timed out.")) return;
+      reportPreviewFailure(url, requestId, "Video preview timed out.");
+    }, PREVIEW_LOAD_TIMEOUT_MS);
     video.src = url;
     video.controls = true;
     video.muted = true;
     video.playsInline = true;
     video.addEventListener("loadedmetadata", () => {
+      window.clearTimeout(timeout);
       updateMediaMetadata(url, requestId, {
         width: video.videoWidth || undefined,
         height: video.videoHeight || undefined
       });
     });
     video.addEventListener("error", () => {
+      window.clearTimeout(timeout);
       if (requestId !== mediaMetadataRequest) return;
-      if (tryFallbackPreviewUrl(url, requestId)) return;
-      showPreviewLoadFailure(url, requestId, "Video preview failed to load.");
+      if (tryFallbackPreviewUrl(url, requestId, "Video preview failed to load.")) return;
+      reportPreviewFailure(url, requestId, "Video preview failed to load.");
+    }, { once: true });
+    els.preview.append(video);
+    return;
+  }
+
+  if (isBlombooruApiUrl(url)) {
+    void renderImageBlobPreview(url, requestId);
+    return;
+  }
+
+  renderPreviewUrlDirect(url, requestId);
+}
+
+async function renderPageContextPreviewFirst(url: string, requestId: number): Promise<void> {
+  const loading = document.createElement("div");
+  loading.className = "preview-empty";
+  loading.textContent = "Loading preview...";
+  els.preview.replaceChildren(loading);
+
+  if (await tryPageContextBlobPreview(url, requestId)) return;
+  if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+  renderPreviewUrlDirect(url, requestId);
+}
+
+function renderPreviewUrlDirect(url: string, requestId: number): void {
+  if (isVideoUrl(url)) {
+    const video = document.createElement("video");
+    const timeout = window.setTimeout(() => {
+      if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+      if (tryFallbackPreviewUrl(url, requestId, "Video preview timed out.")) return;
+      reportPreviewFailure(url, requestId, "Video preview timed out.");
+    }, PREVIEW_LOAD_TIMEOUT_MS);
+    video.src = url;
+    video.controls = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.addEventListener("loadedmetadata", () => {
+      window.clearTimeout(timeout);
+      updateMediaMetadata(url, requestId, {
+        width: video.videoWidth || undefined,
+        height: video.videoHeight || undefined
+      });
+    });
+    video.addEventListener("error", () => {
+      window.clearTimeout(timeout);
+      if (requestId !== mediaMetadataRequest) return;
+      if (tryFallbackPreviewUrl(url, requestId, "Video preview failed to load.")) return;
+      reportPreviewFailure(url, requestId, "Video preview failed to load.");
     }, { once: true });
     els.preview.append(video);
     return;
   }
 
   const image = document.createElement("img");
+  const timeout = window.setTimeout(() => {
+    if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
+    if (tryFallbackPreviewUrl(url, requestId, "Preview timed out.")) return;
+    reportPreviewFailure(url, requestId, "Preview timed out.");
+  }, PREVIEW_LOAD_TIMEOUT_MS);
   image.src = url;
   image.alt = "";
   markBlurSensitiveImage(image);
   image.addEventListener("load", () => {
+    window.clearTimeout(timeout);
     updateMediaMetadata(url, requestId, {
       width: image.naturalWidth || undefined,
       height: image.naturalHeight || undefined
     });
   });
   image.addEventListener("error", () => {
+    window.clearTimeout(timeout);
     if (requestId !== mediaMetadataRequest) return;
     void renderImageBlobPreview(url, requestId);
   }, { once: true });
@@ -1921,22 +2561,49 @@ async function renderImageBlobPreview(url: string, requestId: number): Promise<v
   els.preview.replaceChildren(loading);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       credentials: "include",
       referrerPolicy: "no-referrer"
-    });
+    }, PREVIEW_LOAD_TIMEOUT_MS);
 
     if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
-    if (!response.ok) throw new Error(`Preview fetch failed (${response.status}).`);
+    const responseContentType = normalizedMimeType(response.headers.get("content-type"));
+    if (!response.ok) {
+      throw new PreviewResponseError(`Preview fetch failed (${response.status}).`, {
+        status: response.status,
+        contentType: responseContentType || undefined,
+        responseUrl: response.url || undefined,
+        bodyPreview: await responseTextPreview(response),
+        authAttempted: authAttemptedForUrl(url)
+      });
+    }
 
     const blob = await response.blob();
-    if (!blob.type.startsWith("image/")) throw new Error(blob.type ? `Preview is ${blob.type}.` : "Preview is not an image.");
+    const contentType = normalizedMimeType(blob.type || responseContentType);
+    if (contentType && isClearlyNonMediaMime(contentType)) {
+      throw new PreviewResponseError(`Preview URL returned ${contentType}.`, {
+        status: response.status,
+        contentType,
+        responseUrl: response.url || undefined,
+        bodyPreview: await blobTextPreview(blob),
+        authAttempted: authAttemptedForUrl(url)
+      });
+    }
+    if (contentType && !contentType.startsWith("image/")) {
+      throw new PreviewResponseError(`Preview is ${contentType}.`, {
+        status: response.status,
+        contentType,
+        responseUrl: response.url || undefined,
+        bodyPreview: await blobTextPreview(blob),
+        authAttempted: authAttemptedForUrl(url)
+      });
+    }
 
     revokePreviewObjectUrl();
     previewObjectUrl = URL.createObjectURL(blob);
     updateMediaMetadata(url, requestId, {
       bytes: blob.size || mediaMetadata?.bytes,
-      mimeType: blob.type || mediaMetadata?.mimeType,
+      mimeType: contentType || mediaMetadata?.mimeType,
       sizeSource: "blob",
       loading: false
     });
@@ -1954,45 +2621,318 @@ async function renderImageBlobPreview(url: string, requestId: number): Promise<v
     });
     image.addEventListener("error", () => {
       if (requestId !== mediaMetadataRequest) return;
-      if (tryFallbackPreviewUrl(url, requestId)) return;
-      showPreviewLoadFailure(url, requestId, "Preview blob could not be displayed.");
+      if (tryFallbackPreviewUrl(url, requestId, "Preview blob could not be displayed.")) return;
+      reportPreviewFailure(url, requestId, "Preview blob could not be displayed.");
     }, { once: true });
     els.preview.replaceChildren(image);
   } catch (error) {
     if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return;
-    if (tryFallbackPreviewUrl(url, requestId)) return;
-    showPreviewLoadFailure(url, requestId, error instanceof Error ? error.message : "Preview failed to load.");
+    const message = error instanceof Error ? error.message : "Preview failed to load.";
+    const detail = error instanceof PreviewResponseError ? error.detail : undefined;
+    recordPreviewCandidateFailure(url, message, detail);
+    previewFailedUrls.add(url);
+    if (await tryPageContextBlobPreview(url, requestId)) return;
+    if (tryFallbackPreviewUrl(url, requestId, message, detail)) return;
+    reportPreviewFailure(url, requestId, message, detail);
   }
+}
+
+async function tryPageContextBlobPreview(url: string, requestId: number): Promise<boolean> {
+  const rawUrl = pageMediaUrlForCandidate(url);
+  if (!rawUrl) return false;
+
+  try {
+    const fetched = await fetchPageContextMediaBlob(rawUrl);
+    if (requestId !== mediaMetadataRequest || mediaMetadata?.url !== url) return true;
+
+    const contentType = normalizedMimeType(fetched.contentType || fetched.blob.type);
+    if (contentType && isClearlyNonMediaMime(contentType)) {
+      throw new Error(`Page media returned ${contentType}.`);
+    }
+    if (contentType && !contentType.startsWith("image/")) {
+      throw new Error(`Page media is ${contentType}.`);
+    }
+
+    revokePreviewObjectUrl();
+    previewObjectUrl = URL.createObjectURL(fetched.blob);
+    updateMediaMetadata(url, requestId, {
+      bytes: fetched.blob.size || mediaMetadata?.bytes,
+      mimeType: contentType || mediaMetadata?.mimeType,
+      sizeSource: "blob",
+      loading: false,
+      error: undefined
+    });
+
+    const image = document.createElement("img");
+    image.src = previewObjectUrl;
+    image.alt = "";
+    markBlurSensitiveImage(image);
+    image.addEventListener("load", () => {
+      updateMediaMetadata(url, requestId, {
+        width: image.naturalWidth || undefined,
+        height: image.naturalHeight || undefined,
+        loading: false,
+        error: undefined
+      });
+    });
+    image.addEventListener("error", () => {
+      if (requestId !== mediaMetadataRequest) return;
+      const message = "Page media blob could not be displayed.";
+      recordPageContextFetchDetail({ url: rawUrl, error: message });
+      if (tryFallbackPreviewUrl(url, requestId, message)) return;
+      reportPreviewFailure(url, requestId, message);
+    }, { once: true });
+    els.preview.replaceChildren(image);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Page media fetch failed.";
+    recordPageContextFetchDetail({ url: rawUrl, error: message });
+    return false;
+  }
+}
+
+async function fetchPageContextMediaBlob(rawUrl: string): Promise<{ url: string; blob: Blob; contentType: string; bytes: number }> {
+  const requestKey = normalizedHttpUrl(rawUrl) || rawUrl;
+  const cached = pageContextMediaCache.get(requestKey);
+  if (cached && Date.now() - cached.cachedAt < 60_000) {
+    return cached;
+  }
+
+  const inFlight = pageContextMediaRequests.get(requestKey);
+  if (inFlight) return inFlight;
+
+  const request = fetchPageContextMediaBlobUncached(rawUrl)
+    .then((result) => {
+      pageContextMediaCache.set(requestKey, { ...result, cachedAt: Date.now() });
+      prunePageContextMediaCache();
+      return result;
+    })
+    .finally(() => {
+      pageContextMediaRequests.delete(requestKey);
+    });
+  pageContextMediaRequests.set(requestKey, request);
+  return request;
+}
+
+function prunePageContextMediaCache(): void {
+  const entries = Array.from(pageContextMediaCache.entries());
+  if (entries.length <= 10) return;
+  for (const [key] of entries.sort((a, b) => a[1].cachedAt - b[1].cachedAt).slice(0, entries.length - 10)) {
+    pageContextMediaCache.delete(key);
+  }
+}
+
+async function fetchPageContextMediaBlobUncached(rawUrl: string): Promise<{ url: string; blob: Blob; contentType: string; bytes: number }> {
+  const tabId = pendingTabId ?? (await currentTabId());
+  if (typeof tabId !== "number") throw new Error("No page tab available for media fetch.");
+
+  let response: PageMediaFetchResponse | undefined;
+  try {
+    response = await chrome.tabs.sendMessage(tabId, {
+      type: FETCH_PAGE_MEDIA_MESSAGE,
+      url: rawUrl
+    }) as PageMediaFetchResponse | undefined;
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Page media fetch message failed.");
+  }
+
+  if (!response?.ok || !response.base64) {
+    throw new Error(response?.error || "Page media fetch failed.");
+  }
+
+  const bytes = base64ToUint8Array(response.base64);
+  const contentType = normalizedMimeType(response.contentType);
+  const blobPart = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const blob = new Blob([blobPart], {
+    type: contentType || "application/octet-stream"
+  });
+  const fetchedUrl = normalizedHttpUrl(response.url) || rawUrl;
+  recordPageContextFetchDetail({
+    url: rawUrl,
+    responseUrl: fetchedUrl,
+    bytes: response.bytes ?? blob.size,
+    contentType
+  });
+
+  return {
+    url: fetchedUrl,
+    blob,
+    contentType,
+    bytes: response.bytes ?? blob.size
+  };
+}
+
+function pageMediaUrlForCandidate(candidateUrl: string): string | undefined {
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return undefined;
+
+  const rawUrl = normalizedHttpUrl(unproxiedBooruProxyImageUrl(candidateUrl));
+  if (!rawUrl || isBlombooruApiUrl(rawUrl)) return undefined;
+  return rawUrl;
+}
+
+function recordPageContextFetchDetail(detail: PageContextFetchDetail): void {
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return;
+
+  pageContextFetchDetails = [...pageContextFetchDetails, detail];
+  updateBooruImportDebug({
+    delegated: Boolean(draft.blombooruBooruImport),
+    mediaStrategy: booruMediaStrategy(draft),
+    pageContextFetchUrl: detail.url,
+    pageContextFetchResponseUrl: detail.responseUrl,
+    pageContextFetchBytes: detail.bytes,
+    pageContextFetchContentType: detail.contentType,
+    pageContextFetchError: detail.error,
+    pageContextFetches: pageContextFetchDetails
+  });
+  renderDebugPanel();
+}
+
+function base64ToUint8Array(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function previewUrlCandidates(): string[] {
-  const delegated = draft.blombooruBooruImport;
-  if (delegated) {
-    return uniqueUrls([
-      ...fullQualityUrlCandidates([delegated.proxyFileUrl, delegated.proxyPreviewUrl]),
-      ...fullQualityUrlCandidates([
-        draft.mediaUrl,
-        delegated.fileUrl,
-        draft.previewUrl,
-        delegated.previewUrl,
-        ...rawMediaUrls(draft.raw)
-      ])
-    ]);
-  }
-
-  return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
+  return previewUrlCandidatesForDraft(draft);
 }
 
-function tryFallbackPreviewUrl(failedUrl: string, requestId: number): boolean {
+function previewUrlCandidatesForDraft(nextDraft: ImportDraft): string[] {
+  const delegated = nextDraft.blombooruBooruImport;
+  if (delegated) {
+    return delegatedBooruMediaCandidates(nextDraft);
+  }
+  if (nextDraft.site === "booru") {
+    if (shouldUsePageSessionBooruMedia(nextDraft)) return rawFallbackBooruMediaCandidates(nextDraft);
+    return fallbackBooruMediaCandidates(nextDraft);
+  }
+
+  return fullQualityUrlCandidates([nextDraft.mediaUrl, nextDraft.previewUrl, ...rawMediaUrls(nextDraft.raw)]);
+}
+
+function fallbackBooruMediaCandidates(nextDraft: ImportDraft): string[] {
+  return rawFallbackBooruMediaCandidates(nextDraft);
+}
+
+function rawFallbackBooruMediaCandidates(nextDraft: ImportDraft): string[] {
+  return fullQualityUrlCandidates(
+    [nextDraft.mediaUrl, nextDraft.previewUrl, ...rawMediaUrls(nextDraft.raw)]
+      .map((url) => unproxiedBooruProxyImageUrl(url))
+  ).filter((url) => !isBooruProxyImageUrl(url));
+}
+
+function delegatedBooruMediaCandidates(nextDraft: ImportDraft): string[] {
+  const delegated = nextDraft.blombooruBooruImport;
+  if (!delegated) return [];
+
+  return uniqueUrls([
+    ...proxiedDelegatedBooruMediaCandidates(nextDraft),
+    ...rawDelegatedBooruMediaCandidates(nextDraft)
+  ]);
+}
+
+function proxiedDelegatedBooruMediaCandidates(nextDraft: ImportDraft): string[] {
+  const delegated = nextDraft.blombooruBooruImport;
+  if (!delegated) return [];
+  return fullQualityUrlCandidates([delegated.proxyFileUrl, delegated.proxyPreviewUrl]);
+}
+
+function rawDelegatedBooruMediaCandidates(nextDraft: ImportDraft): string[] {
+  const delegated = nextDraft.blombooruBooruImport;
+  if (!delegated) return [];
+  const proxied = new Set(proxiedDelegatedBooruMediaCandidates(nextDraft));
+
+  return fullQualityUrlCandidates([
+    delegated.fileUrl,
+    delegated.previewUrl,
+    nextDraft.mediaUrl,
+    nextDraft.previewUrl,
+    ...rawMediaUrls(nextDraft.raw)
+  ]).filter((url) => !proxied.has(url));
+}
+
+function recordSelectedBooruPreviewUrl(url: string, previewReused = false): void {
+  const delegated = draft.blombooruBooruImport;
+  if (draft.site !== "booru" && !delegated) return;
+
+  updateBooruImportDebug({
+    delegated: Boolean(delegated),
+    mediaStrategy: booruMediaStrategy(draft),
+    selectedPreviewUrl: url,
+    previewReused,
+    proxyFileUrl: delegated?.proxyFileUrl,
+    proxyPreviewUrl: delegated?.proxyPreviewUrl
+  });
+}
+
+function nextPreviewFallbackUrl(): string | undefined {
+  if (!draft.blombooruBooruImport) {
+    return previewUrlCandidates().find((candidate) => !previewFailedUrls.has(candidate));
+  }
+
+  const proxied = proxiedDelegatedBooruMediaCandidates(draft);
+  const proxyFallback = proxied.find((candidate) => !previewFailedUrls.has(candidate));
+  if (proxyFallback) return proxyFallback;
+
+  return rawDelegatedBooruMediaCandidates(draft).find((candidate) => !previewFailedUrls.has(candidate));
+}
+
+function reportPreviewFailure(
+  url: string,
+  requestId: number,
+  message: string,
+  detail: Omit<PreviewFailureDetail, "url" | "error"> = {}
+): void {
+  if (requestId !== mediaMetadataRequest) return;
+  recordPreviewCandidateFailure(url, message, detail);
+  showPreviewLoadFailure(url, requestId, message);
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return;
+
+  updateBooruImportDebug({
+    mediaValidationRejectedUrl: url,
+    mediaValidationError: message,
+    previewFailures: previewFailureDetails
+  });
+  renderDebugPanel();
+}
+
+function tryFallbackPreviewUrl(
+  failedUrl: string,
+  requestId: number,
+  message = "Preview candidate failed.",
+  detail: Omit<PreviewFailureDetail, "url" | "error"> = {}
+): boolean {
+  recordPreviewCandidateFailure(failedUrl, message, detail);
   previewFailedUrls.add(failedUrl);
-  const fallback = previewUrlCandidates().find((candidate) => !previewFailedUrls.has(candidate));
+  const fallback = nextPreviewFallbackUrl();
   if (!fallback) return false;
   revokePreviewObjectUrl();
   els.preview.replaceChildren();
   resetMediaMetadata(fallback);
+  recordSelectedBooruPreviewUrl(fallback);
+  renderDebugPanel();
   void fetchHeadMediaMetadata(fallback, requestId);
   renderPreviewUrl(fallback, requestId);
   return true;
+}
+
+function recordPreviewCandidateFailure(
+  url: string,
+  error: string,
+  detail: Omit<PreviewFailureDetail, "url" | "error"> = {}
+): void {
+  const next: PreviewFailureDetail = { url, error, ...detail };
+  if (previewFailureDetails.some((item) => item.url === url && item.error === error)) return;
+  previewFailureDetails = [...previewFailureDetails, next];
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return;
+
+  updateBooruImportDebug({
+    delegated: Boolean(draft.blombooruBooruImport),
+    previewFailures: previewFailureDetails
+  });
 }
 
 function showPreviewLoadFailure(url: string, requestId: number, message: string): void {
@@ -2086,12 +3026,13 @@ function renderMediaMetadata(): void {
 
 function renderChips(): void {
   const parsed = parseTagsWithHints(els.tags.value);
-  const artist = normalizeTag(els.artist.value);
+  const artists = artistInputTags();
+  const artistSet = new Set(artists);
   const hints = { ...booruImportCategoryHints(parsed.tags), ...parsed.categoryHints };
   const normalTags = nonRatingTags(parsed.tags);
-  const tags = artist ? mergeTags(normalTags.filter((tag) => tag !== artist), [artist]) : normalTags;
+  const tags = artists.length ? mergeTags(normalTags.filter((tag) => !artistSet.has(tag)), artists) : normalTags;
 
-  if (artist) hints[artist] = "artist";
+  for (const artist of artists) hints[artist] = "artist";
 
   els.chips.replaceChildren(...tags.map((tag) => chipForTag(tag, hints[tag])));
 }
@@ -2114,6 +3055,8 @@ function knownChipCategory(category: string): string {
 }
 
 async function persistSettings(): Promise<void> {
+  const previousBaseUrl = settings.baseUrl;
+  const previousApiKey = settings.apiKey;
   settings = normalizeSettings({
     baseUrl: els.baseUrl.value,
     apiKey: els.apiKey.value,
@@ -2132,6 +3075,9 @@ async function persistSettings(): Promise<void> {
     multiAddCaptureRightClick: els.multiAddCaptureRightClick.checked,
     debugMode: els.debugMode.checked
   });
+  if (settings.baseUrl !== previousBaseUrl || settings.apiKey !== previousApiKey) {
+    artistLookupCache.clear();
+  }
   await saveSettings(settings);
   renderSettings(settings);
   renderDebugPanel();
@@ -2318,7 +3264,7 @@ async function downloadCurrentBooruImport(
   if (!state?.originalUrl) throw new Error("No Blombooru booru import source URL found.");
 
   setStatus("Importing with Blombooru booru import...", "info");
-  return api.downloadBooruImport({
+  const result = await api.downloadBooruImport({
     url: state.originalUrl,
     tags: payload.tags,
     rating: payload.rating,
@@ -2326,30 +3272,100 @@ async function downloadCurrentBooruImport(
     autoCreateTags: true,
     categoryHints: payload.categoryHints
   });
+
+  if (!result.id && !result.link) {
+    throw new Error("Blombooru booru import finished, but did not return an imported media id or link.");
+  }
+
+  return result;
 }
 
 async function fetchCurrentMediaAsStableFile(mediaUrls: string[]): Promise<{ url: string; stable: Awaited<ReturnType<typeof fetchMediaAsStableFile>> }> {
   let lastError: unknown;
 
   for (const url of mediaUrls) {
+    const preferPageContext = shouldPreferPageContextMediaFetch(url);
+    if (preferPageContext) {
+      const pageFetched = await fetchPageContextStableFile(url);
+      if (pageFetched) return pageFetched;
+    }
+
     try {
       return {
         url,
-        stable: await fetchMediaAsStableFile(url)
+        stable: await fetchMediaAsStableFile(url, authenticatedRequestInit(url))
       };
     } catch (error) {
       lastError = error;
+      recordMediaValidationFailure(url, error);
+      if (!preferPageContext) {
+        const pageFetched = await fetchPageContextStableFile(url);
+        if (pageFetched) return pageFetched;
+      }
     }
   }
 
   throw lastError instanceof Error ? lastError : new Error("Media fetch failed.");
 }
 
-function mediaFetchCandidates(): string[] {
-  if (isFourChanCatalogueDraft(draft)) {
-    return fullQualityUrlCandidates([draft.mediaUrl]);
+function shouldPreferPageContextMediaFetch(candidateUrl: string): boolean {
+  return shouldUsePageSessionBooruMedia(draft) && Boolean(pageMediaUrlForCandidate(candidateUrl));
+}
+
+async function fetchPageContextStableFile(candidateUrl: string): Promise<{ url: string; stable: StableFileResult } | undefined> {
+  const rawUrl = pageMediaUrlForCandidate(candidateUrl);
+  if (!rawUrl) return undefined;
+
+  try {
+    const fetched = await fetchPageContextMediaBlob(rawUrl);
+    return {
+      url: candidateUrl,
+      stable: await stableFileFromBlob(fetched.url, fetched.blob, fetched.contentType)
+    };
+  } catch (error) {
+    recordPageContextFetchDetail({
+      url: rawUrl,
+      error: error instanceof Error ? error.message : "Page media fetch failed."
+    });
+    recordMediaValidationFailure(rawUrl, error);
+    return undefined;
   }
-  return fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
+}
+
+function mediaFetchCandidates(): string[] {
+  let candidates: string[];
+  if (isFourChanCatalogueDraft(draft)) {
+    candidates = fullQualityUrlCandidates([draft.mediaUrl]);
+  } else if (shouldUsePageSessionBooruMedia(draft)) {
+    candidates = rawFallbackBooruMediaCandidates(draft);
+  } else if (draft.site === "booru" && !draft.blombooruBooruImport) {
+    candidates = fallbackBooruMediaCandidates(draft);
+  } else {
+    candidates = fullQualityUrlCandidates([draft.mediaUrl, draft.previewUrl, ...rawMediaUrls(draft.raw)]);
+  }
+
+  if (draft.site === "booru" || draft.blombooruBooruImport) {
+    updateBooruImportDebug({
+      delegated: Boolean(draft.blombooruBooruImport),
+      mediaStrategy: booruMediaStrategy(draft),
+      mediaFetchCandidates: candidates
+    });
+    renderDebugPanel();
+  }
+
+  return candidates;
+}
+
+function recordMediaValidationFailure(url: string, error: unknown): void {
+  if (draft.site !== "booru" && !draft.blombooruBooruImport) return;
+
+  updateBooruImportDebug({
+    delegated: Boolean(draft.blombooruBooruImport),
+    mediaStrategy: booruMediaStrategy(draft),
+    mediaValidationRejectedUrl: url,
+    mediaValidationError: error instanceof Error ? error.message : "Media validation failed."
+  });
+  renderDebugPanel();
 }
 
 function markUploaded(upload: UploadMediaResult, options: { mediaId?: string; finalSaved?: boolean } = {}): void {
@@ -2404,9 +3420,9 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
   const parsed = parseTagsWithHints(els.tags.value);
   const categoryHints = { ...booruImportCategoryHints(parsed.tags), ...parsed.categoryHints };
   const extraTags = extraPredictions.map((prediction) => prediction.name);
-  const artist = normalizeTag(els.artist.value);
+  const artists = artistInputTags();
 
-  if (artist) categoryHints[artist] = "artist";
+  for (const artist of artists) categoryHints[artist] = "artist";
 
   for (const prediction of extraPredictions) {
     const name = normalizeTag(prediction.name);
@@ -2416,7 +3432,7 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
     }
   }
 
-  const tags = mergeTags(nonRatingTags(parsed.tags), nonRatingTags(extraTags), artist ? [artist] : []);
+  const tags = mergeTags(nonRatingTags(parsed.tags), nonRatingTags(extraTags), artists);
   const tagSet = new Set(tags);
   for (const name of Object.keys(categoryHints)) {
     if (!tagSet.has(name)) delete categoryHints[name];
@@ -2428,6 +3444,10 @@ function buildFinalPayload(extraPredictions: AiTagPrediction[] = []): {
     rating: getRating(),
     source: els.source.value.trim()
   };
+}
+
+function artistInputTags(): string[] {
+  return parseCommaSeparatedTags(els.artist.value);
 }
 
 function booruImportCategoryHints(currentTags: string[]): Record<string, string> {
@@ -2828,7 +3848,8 @@ function buildDebugReport(): Record<string, unknown> {
     note: "Boo Check debug report. Contains page/source/media URLs, but excludes API keys, auth headers, cookies, and fetched media data.",
     generatedAt: new Date().toISOString(),
     extension: {
-      version: chrome.runtime.getManifest().version
+      version: chrome.runtime.getManifest().version,
+      sidePanelDebugBuild: SIDE_PANEL_DEBUG_BUILD
     },
     settings: {
       baseUrl: settings.baseUrl,
@@ -2915,7 +3936,7 @@ function scheduleArtistAutocomplete(): void {
 }
 
 async function refreshArtistAutocomplete(): Promise<void> {
-  const query = normalizeTag(els.artist.value);
+  const query = normalizeTag(currentArtistInputSegment().token);
   if (!query) {
     hideArtistAutocomplete();
     return;
@@ -2993,9 +4014,10 @@ function moveArtistAutocomplete(delta: number): void {
 function selectArtistAutocomplete(index: number): void {
   const item = artistAutocompleteItems[index];
   if (!item) return;
-  els.artist.value = item.name;
+  const replaced = replaceCurrentArtistInputSegment(item.name);
+  els.artist.value = replaced.text;
   els.artist.focus();
-  els.artist.setSelectionRange(item.name.length, item.name.length);
+  els.artist.setSelectionRange(replaced.cursor, replaced.cursor);
   categoryCache.set(item.name, normalizeCategory(item.category || "artist"));
   hideArtistAutocomplete();
   renderChips();
@@ -3017,51 +4039,105 @@ function scheduleArtistStatus(): void {
 
 async function refreshArtistStatus(): Promise<void> {
   const requestId = ++artistStatusRequest;
-  const artist = normalizeTag(els.artist.value);
+  const artists = artistInputTags();
 
-  if (!artist) {
+  if (!artists.length) {
     renderArtistStatus("No artist tag will be sent.", "info");
     return;
   }
 
-  const cachedCategory = categoryCache.get(artist);
-  if (cachedCategory) {
-    renderExistingArtistStatus(cachedCategory);
+  const cachedResults = artists
+    .map((artist) => {
+      const cached = artistLookupCache.get(artist);
+      return cached ? { name: artist, ...cached } : undefined;
+    })
+    .filter((item): item is ArtistStatusResult => Boolean(item));
+  if (cachedResults.length === artists.length) {
+    renderArtistSummary(cachedResults);
     return;
   }
 
-  renderArtistStatus("Checking artist tag...", "info");
+  renderArtistStatus(artists.length === 1 ? "Checking artist tag..." : `Checking ${artists.length} artist tags...`, "info");
+  const artistKey = artists.join(",");
 
   try {
-    const tag = await requireConfiguredApi().lookupTag(artist);
-    if (requestId !== artistStatusRequest || normalizeTag(els.artist.value) !== artist) return;
+    const api = requireConfiguredApi();
+    const results = await Promise.all(artists.map(async (artist) => {
+      const cached = artistLookupCache.get(artist);
+      if (cached) return { name: artist, ...cached };
 
-    if (!tag) {
-      renderArtistStatus("New artist tag will be added.", "new");
-      return;
-    }
-
-    if (tag.category) categoryCache.set(artist, normalizeCategory(tag.category));
-    renderExistingArtistStatus(tag.category);
+      const tag = await api.lookupTag(artist);
+      const category = tag?.category ? normalizeCategory(tag.category) : undefined;
+      if (category && category !== "unknown") categoryCache.set(artist, category);
+      const result: ArtistLookupCacheEntry = {
+        exists: Boolean(tag),
+        category
+      };
+      artistLookupCache.set(artist, result);
+      return { name: artist, ...result };
+    }));
+    if (requestId !== artistStatusRequest || artistInputTags().join(",") !== artistKey) return;
+    renderArtistSummary(results);
   } catch {
     if (requestId !== artistStatusRequest) return;
-    renderArtistStatus("Could not check artist tag. It will be sent as an artist tag on import.", "warning");
+    renderArtistStatus("Could not check artist tags. They will be sent as artist tags on import.", "warning");
   }
 }
 
-function renderExistingArtistStatus(category: string | undefined): void {
-  const normalized = normalizeCategory(category);
-  if (normalized === "artist") {
-    renderArtistStatus("Existing artist tag.", "success");
+function currentArtistInputSegment(): { token: string; rawStart: number; rawEnd: number } {
+  const value = els.artist.value;
+  const cursor = els.artist.selectionStart ?? value.length;
+  const rawStart = cursor > 0 ? value.lastIndexOf(",", cursor - 1) + 1 : 0;
+  const nextComma = value.indexOf(",", cursor);
+  const rawEnd = nextComma === -1 ? value.length : nextComma;
+  const queryStart = Math.min(rawEnd, Math.max(rawStart, cursor));
+  return {
+    token: value.slice(rawStart, queryStart).trim(),
+    rawStart,
+    rawEnd
+  };
+}
+
+function replaceCurrentArtistInputSegment(replacement: string): { text: string; cursor: number } {
+  const segment = currentArtistInputSegment();
+  const normalized = normalizeTag(replacement);
+  let prefix = els.artist.value.slice(0, segment.rawStart).replace(/[ \t]*$/, "");
+  const suffix = els.artist.value.slice(segment.rawEnd);
+  if (prefix.endsWith(",")) prefix += " ";
+  const text = `${prefix}${normalized}${suffix}`;
+  return {
+    text,
+    cursor: prefix.length + normalized.length
+  };
+}
+
+function renderArtistSummary(results: ArtistStatusResult[]): void {
+  const total = results.length;
+  const existing = results.filter((item) => item.exists);
+  const artistCount = existing.filter((item) => normalizeCategory(item.category) === "artist").length;
+  const unconfirmedArtistCount = existing.length - artistCount;
+  const newCount = total - existing.length;
+
+  if (unconfirmedArtistCount) {
+    renderArtistStatus(total === 1 ? "Existing tag is not confirmed as an artist tag. Blombooru may keep its category." : `${unconfirmedArtistCount} existing artist entries are not confirmed artist tags. Blombooru may keep those categories.`, "warning");
     return;
   }
 
-  if (normalized && normalized !== "unknown") {
-    renderArtistStatus(`Existing ${normalized} tag. Blombooru may keep that category.`, "warning");
+  if (newCount && artistCount) {
+    renderArtistStatus(`${artistCount} existing artist ${pluralNoun(artistCount, "tag")}; ${newCount} new ${pluralNoun(newCount, "artist tag")} will be added.`, "new");
     return;
   }
 
-  renderArtistStatus("New artist tag will be added.", "new");
+  if (newCount) {
+    renderArtistStatus(total === 1 ? "New artist tag will be added." : `${newCount} new artist tags will be added.`, "new");
+    return;
+  }
+
+  renderArtistStatus(total === 1 ? "Existing artist tag." : `${total} existing artist tags.`, "success");
+}
+
+function pluralNoun(count: number, noun: string): string {
+  return count === 1 ? noun : `${noun}s`;
 }
 
 function renderArtistStatus(message: string, tone: "info" | "success" | "new" | "warning"): void {
@@ -3200,7 +4276,125 @@ function hideAutocomplete(): void {
 }
 
 function isVideoUrl(url: string): boolean {
-  return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(url);
+  return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(mediaUrlForExtensionCheck(url));
+}
+
+function mediaUrlForExtensionCheck(value: string): string {
+  try {
+    const url = new URL(value);
+    return url.searchParams.get("url") || value;
+  } catch {
+    return value;
+  }
+}
+
+function unproxiedBooruProxyImageUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (!isBooruProxyImageUrl(value)) return value;
+
+  try {
+    return new URL(value).searchParams.get("url") || value;
+  } catch {
+    return value;
+  }
+}
+
+function isBooruProxyImageUrl(value: string | undefined): boolean {
+  if (!value) return false;
+
+  try {
+    const url = new URL(value);
+    return url.pathname.includes("/api/booru-import/proxy-image") && url.searchParams.has("url");
+  } catch {
+    return false;
+  }
+}
+
+function normalizedMimeType(value: string | undefined | null): string {
+  return value?.split(";")[0]?.trim().toLowerCase() ?? "";
+}
+
+function isClearlyNonMediaMime(value: string | undefined): boolean {
+  const mimeType = normalizedMimeType(value);
+  return mimeType.startsWith("text/") ||
+    mimeType === "application/json" ||
+    mimeType === "application/xml" ||
+    mimeType === "application/xhtml+xml";
+}
+
+async function responseTextPreview(response: Response): Promise<string | undefined> {
+  const contentType = normalizedMimeType(response.headers.get("content-type"));
+  if (!isTextLikeMime(contentType)) return undefined;
+
+  try {
+    return textPreview(await response.clone().text());
+  } catch {
+    return undefined;
+  }
+}
+
+async function blobTextPreview(blob: Blob): Promise<string | undefined> {
+  try {
+    return textPreview(await blob.text());
+  } catch {
+    return undefined;
+  }
+}
+
+function isTextLikeMime(mimeType: string): boolean {
+  return mimeType.startsWith("text/") ||
+    mimeType === "application/json" ||
+    mimeType === "application/xml" ||
+    mimeType === "application/xhtml+xml";
+}
+
+function textPreview(value: string): string | undefined {
+  const preview = value.replace(/\s+/g, " ").trim().slice(0, 240);
+  return preview || undefined;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...authenticatedRequestInit(url, init),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function authenticatedRequestInit(url: string, init: RequestInit = {}): RequestInit {
+  if (!settings.apiKey || !isBlombooruApiUrl(url)) return init;
+
+  const headers = new Headers(init.headers);
+  if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${settings.apiKey}`);
+  return {
+    ...init,
+    headers
+  };
+}
+
+function authAttemptedForUrl(url: string): boolean {
+  return Boolean(settings.apiKey && isBlombooruApiUrl(url));
+}
+
+function isBlombooruApiUrl(value: string): boolean {
+  if (!settings.baseUrl) return false;
+
+  try {
+    const url = new URL(value);
+    const baseUrl = new URL(settings.baseUrl);
+    return url.origin === baseUrl.origin && url.pathname.startsWith("/api/");
+  } catch {
+    return false;
+  }
 }
 
 function uniqueUrls(values: Array<string | undefined>): string[] {
@@ -3226,12 +4420,27 @@ function preferOriginalUrls(urls: string[]): string[] {
 
 function fullQualityUrlCandidates(values: Array<string | undefined>): string[] {
   const promotedUrls = values.flatMap((value) => {
-    const fullUrl = fullQualityProxyUrl(value);
-    return fullUrl ? [fullUrl] : [];
+    const urls = [fullQualityProxyUrl(value), fullQualityRawBooruMediaUrl(value)];
+    return urls.filter((url): url is string => Boolean(url));
   });
   const originalUrls = values.filter((value): value is string => Boolean(value));
 
   return preferOriginalUrls(uniqueUrls([...promotedUrls, ...originalUrls]));
+}
+
+function fullQualityRawBooruMediaUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    const before = url.href;
+    url.pathname = url.pathname.replace(/\/data\/sample\/(.+\/)?sample-([^/]+)$/i, (_match, dirs: string | undefined, filename: string) =>
+      `/data/original/${dirs ?? ""}${filename}`
+    );
+    return url.href !== before ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function fullQualityProxyUrl(value: string | undefined): string | undefined {
@@ -3283,6 +4492,37 @@ function rawMediaUrls(raw: unknown): string[] {
   return uniqueUrls(urls);
 }
 
+function isPageSessionBooruDraft(nextDraft: ImportDraft): boolean {
+  if (nextDraft.site !== "booru" || nextDraft.blombooruBooruImport) return false;
+  return Boolean(findRawRecord(nextDraft.raw, "pageBooruPostFetch"));
+}
+
+function shouldUsePageSessionBooruMedia(nextDraft: ImportDraft): boolean {
+  return booruMediaStrategy(nextDraft) === "page-session";
+}
+
+function findRawRecord(raw: unknown, key: string): Record<string, unknown> | undefined {
+  const seenObjects = new Set<object>();
+
+  const visit = (value: unknown): Record<string, unknown> | undefined => {
+    if (!value || typeof value !== "object" || seenObjects.has(value)) return undefined;
+    seenObjects.add(value);
+
+    const record = value as Record<string, unknown>;
+    const match = record[key];
+    if (match && typeof match === "object") return match as Record<string, unknown>;
+
+    for (const child of Object.values(record)) {
+      const found = visit(child);
+      if (found) return found;
+    }
+
+    return undefined;
+  };
+
+  return visit(raw);
+}
+
 function isLikelyMediaCandidateUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -3304,6 +4544,7 @@ function isProbableThumbnailUrl(value: string): boolean {
       path.includes("thumbnail.webp") ||
       path.includes("preview.webp") ||
       path.includes("static.webp") ||
+      path.includes("/data/sample/") ||
       url.searchParams.get("thumbnail") === "1" ||
       url.searchParams.get("preview") === "1" ||
       url.searchParams.get("static") === "1" ||

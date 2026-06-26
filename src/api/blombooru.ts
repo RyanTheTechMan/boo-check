@@ -108,12 +108,13 @@ export class BlombooruApi {
     }
   }
 
-  async fetchBooruImport(url: string): Promise<BooruImportPost> {
+  async fetchBooruImport(url: string, options: { timeoutMs?: number } = {}): Promise<BooruImportPost> {
     const response = await this.fetchRaw(BLOMBOORU_ENDPOINTS.booruImportFetch, {
       method: "POST",
       json: { url },
       authRequired: false,
-      credentials: "include"
+      credentials: "include",
+      timeoutMs: options.timeoutMs ?? 8000
     });
 
     const raw = await readJsonSafely(response);
@@ -302,6 +303,7 @@ export class BlombooruApi {
       body?: BodyInit;
       authRequired?: boolean;
       credentials?: RequestCredentials;
+      timeoutMs?: number;
     }
   ): Promise<Response> {
     if (!this.settings.baseUrl) throw new BlombooruApiError("Missing Blombooru base URL.");
@@ -320,12 +322,27 @@ export class BlombooruApi {
       headers.set("Content-Type", "application/json");
     }
 
-    return fetch(url.href, {
-      method: options.method,
-      headers,
-      body: options.json !== undefined ? JSON.stringify(options.json) : options.body,
-      credentials: options.credentials
-    });
+    const controller = options.timeoutMs ? new AbortController() : undefined;
+    const timeout = controller && options.timeoutMs
+      ? window.setTimeout(() => controller.abort(), options.timeoutMs)
+      : undefined;
+
+    try {
+      return await fetch(url.href, {
+        method: options.method,
+        headers,
+        body: options.json !== undefined ? JSON.stringify(options.json) : options.body,
+        credentials: options.credentials,
+        signal: controller?.signal
+      });
+    } catch (error) {
+      if (controller?.signal.aborted) {
+        throw new BlombooruApiError(`Blombooru request timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)}s.`);
+      }
+      throw error;
+    } finally {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    }
   }
 }
 
@@ -387,7 +404,7 @@ function parseBooruImportTag(item: unknown): BooruImportTag | undefined {
 
   return {
     name,
-    category: normalizeCategory(stringValue(record.category) || stringValue(record.type)),
+    category: normalizeCategory(record.category ?? record.type),
     isNew: booleanValue(record.is_new) ?? booleanValue(record.isNew),
     userAssigned: booleanValue(record.user_assigned) ?? booleanValue(record.userAssigned)
   };

@@ -1,6 +1,13 @@
 import type { AiTagPrediction, TagCategory, TagSuggestion } from "../types";
 
 const CATEGORY_PREFIXES = new Set(["artist", "character", "copyright", "meta", "general"]);
+const DANBOORU_CATEGORY_IDS: Record<string, TagCategory> = {
+  "0": "general",
+  "1": "artist",
+  "3": "copyright",
+  "4": "character",
+  "5": "meta"
+};
 const RATING_TAGS = new Set(["safe", "questionable", "explicit", "rating_safe", "rating_questionable", "rating_explicit"]);
 
 export type ParsedTags = {
@@ -13,21 +20,52 @@ export function normalizeTag(value: string | undefined | null): string {
   return value
     .trim()
     .replace(/^#+/, "")
-    .replace(/^[\s"'`.,;!?()[\]{}<>]+|[\s"'`.,;!?()[\]{}<>]+$/g, "")
+    .replace(/^[\s"'`.,;!?<>]+|[\s"'`.,;!?<>]+$/g, "")
     .replace(/\s+/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
     .toLowerCase();
 }
 
-export function normalizeCategory(value: string | undefined | null): TagCategory {
-  if (!value) return "unknown";
-  const normalized = value.trim().toLowerCase().replace(/\s+/g, "_");
+export function normalizeCategory(value: unknown): TagCategory {
+  if (value === undefined || value === null) return "unknown";
+  const raw = String(value).trim();
+  if (!raw) return "unknown";
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, "_");
+  for (const token of categoryTokens(raw.toLowerCase())) {
+    const category = normalizeCategoryToken(token);
+    if (category) return category;
+  }
+
+  if (/^\d+$/.test(normalized)) return "unknown";
+  return normalized || "unknown";
+}
+
+function categoryTokens(value: string): string[] {
+  const tokens = value.split(/[\s.]+/).filter(Boolean);
+  return [value, ...tokens].flatMap((token) => {
+    const normalized = token.trim().replace(/-/g, "_").replace(/\s+/g, "_");
+    const prefixed = /^(?:tag_)?(?:type|category)_|^tag_category_/.test(normalized);
+    const stripped = normalized
+      .replace(/^tag_type_/, "")
+      .replace(/^tag_category_/, "")
+      .replace(/^type_/, "")
+      .replace(/^category_/, "");
+    return prefixed ? [normalized, stripped] : [normalized];
+  });
+}
+
+function normalizeCategoryToken(value: string): TagCategory | undefined {
+  const normalized = value.trim().toLowerCase().replace(/-/g, "_").replace(/\s+/g, "_");
+  if (!normalized) return undefined;
+  if (DANBOORU_CATEGORY_IDS[normalized]) return DANBOORU_CATEGORY_IDS[normalized];
   if (normalized === "copy" || normalized === "copyrights") return "copyright";
   if (normalized === "characters") return "character";
   if (normalized === "artists") return "artist";
   if (normalized === "metadata") return "meta";
-  return normalized || "unknown";
+  if (["general", "artist", "character", "copyright", "meta", "rating"].includes(normalized)) return normalized;
+  return undefined;
 }
 
 export function parseTagsWithHints(text: string): ParsedTags {
@@ -74,6 +112,14 @@ export function mergeTags(...groups: Array<Array<string | undefined | null> | un
 
 export function tagText(tags: string[]): string {
   return tags.length ? `${dedupeTags(tags).join(" ")} ` : "";
+}
+
+export function parseCommaSeparatedTags(text: string): string[] {
+  return dedupeTags(text.split(",").map(normalizeTag).filter(Boolean));
+}
+
+export function commaTagText(tags: string[]): string {
+  return dedupeTags(tags).join(", ");
 }
 
 export function isRatingTag(name: string, category?: string): boolean {

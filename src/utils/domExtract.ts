@@ -14,7 +14,7 @@ export function normalizeAdapterTag(value: string | undefined | null): string {
   return value
     .trim()
     .replace(/^#+/, "")
-    .replace(/^[\s"'`.,;!?()[\]{}<>]+|[\s"'`.,;!?()[\]{}<>]+$/g, "")
+    .replace(/^[\s"'`.,;!?<>]+|[\s"'`.,;!?<>]+$/g, "")
     .replace(/\s+/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
@@ -63,6 +63,7 @@ export function elementUrls(element: Element): string[] {
     add(element.src);
     add(element.getAttribute("data-src"));
     add(element.getAttribute("data-original"));
+    add(element.getAttribute("data-file-url"));
   } else if (element instanceof HTMLVideoElement) {
     add(element.currentSrc);
     add(element.src);
@@ -81,7 +82,13 @@ export function elementUrls(element: Element): string[] {
 export function mediaUrlFromElement(element: Element | undefined): string | undefined {
   if (!element) return undefined;
   if (element instanceof HTMLImageElement) {
-    return absoluteUrl(element.currentSrc || element.src || element.getAttribute("data-src"));
+    return absoluteUrl(
+      element.getAttribute("data-original") ||
+      element.getAttribute("data-file-url") ||
+      element.getAttribute("data-src") ||
+      element.currentSrc ||
+      element.src
+    );
   }
   if (element instanceof HTMLVideoElement) {
     return absoluteUrl(element.currentSrc || element.src || element.querySelector("source")?.src);

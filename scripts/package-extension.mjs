@@ -30,7 +30,7 @@ const zipPath = resolve(releaseDir, `${packageJson.name}-${manifest.version}.zip
 
 rmSync(zipPath, { force: true });
 
-execFileSync("zip", ["-r", "-X", zipPath, "."], {
+execFileSync("zip", ["-r", "-X", zipPath, ".", "-x", ".DS_Store", "*/.DS_Store", "__MACOSX/*"], {
   cwd: distDir,
   stdio: "inherit"
 });

@@ -20,6 +20,8 @@ import {
 } from "./utils/domExtract";
 
 const EXTRACT_PAGE_CONTEXT_MESSAGE = "boo-check:extract-page-context";
+const FETCH_PAGE_MEDIA_MESSAGE = "boo-check:fetch-page-media";
+const FETCH_PAGE_BOORU_POST_MESSAGE = "boo-check:fetch-page-booru-post";
 const GET_MULTI_ADD_CAPTURE_STATE_MESSAGE = "boo-check:get-multi-add-capture-state";
 const SET_MULTI_ADD_CAPTURE_MESSAGE = "boo-check:set-multi-add-capture";
 const MULTI_ADD_CAPTURED_DRAFT_MESSAGE = "boo-check:multi-add-captured-draft";
@@ -83,6 +85,7 @@ const TWEET_RESULT_FIELD_TOGGLES_FALLBACK = [
 const AUTO_COLLECT_SCAN_DELAY_MS = 250;
 const AUTO_COLLECT_ROOT_MARGIN = "700px 0px";
 const MAX_AUTO_COLLECT_TARGETS_PER_POST = 12;
+const PAGE_MEDIA_FETCH_MAX_BYTES = 50 * 1024 * 1024;
 
 type TwitterApiMetadata = {
   bearerToken: string;
@@ -191,11 +194,395 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message?.type === FETCH_PAGE_MEDIA_MESSAGE) {
+    void handleFetchPageMedia(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === FETCH_PAGE_BOORU_POST_MESSAGE) {
+    void handleFetchPageBooruPost(message, sendResponse);
+    return true;
+  }
+
   if (message?.type !== EXTRACT_PAGE_CONTEXT_MESSAGE) return false;
 
   void handleExtractPageContext(message, sendResponse);
   return true;
 });
+
+async function handleFetchPageMedia(message: { url?: string }, sendResponse: (response?: unknown) => void): Promise<void> {
+  const url = absoluteUrl(message.url);
+  if (!url) {
+    sendResponse({ ok: false, error: "No page media URL." });
+    return;
+  }
+
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      referrer: location.href
+    });
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "";
+    const contentLength = Number(response.headers.get("content-length") || "0");
+    if (!response.ok) throw new Error(`Page media fetch failed (${response.status}).`);
+    if (contentLength > PAGE_MEDIA_FETCH_MAX_BYTES) {
+      throw new Error(`Page media is too large (${formatDebugBytes(contentLength)}).`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > PAGE_MEDIA_FETCH_MAX_BYTES) {
+      throw new Error(`Page media is too large (${formatDebugBytes(buffer.byteLength)}).`);
+    }
+
+    sendResponse({
+      ok: true,
+      url: response.url || url,
+      contentType,
+      bytes: buffer.byteLength,
+      base64: arrayBufferToBase64(buffer)
+    });
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      url,
+      error: error instanceof Error ? error.message : "Page media fetch failed."
+    });
+  }
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function formatDebugBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+async function handleFetchPageBooruPost(message: { url?: string }, sendResponse: (response?: unknown) => void): Promise<void> {
+  const url = absoluteUrl(message.url);
+  if (!url) {
+    sendResponse({ ok: false, error: "No booru post URL." });
+    return;
+  }
+  if (!sameOriginUrl(url)) {
+    sendResponse({ ok: false, url, error: "Booru post fallback only supports the current site." });
+    return;
+  }
+
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      referrer: location.href
+    });
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "";
+    if (!response.ok) throw new Error(`Booru post fetch failed (${response.status}).`);
+    if (contentType && !/^(?:text\/html|application\/xhtml\+xml)$/i.test(contentType)) {
+      throw new Error(`Booru post fetch returned ${contentType}.`);
+    }
+
+    const html = await response.text();
+    const responseUrl = response.url || url;
+    const draft = extractBooruPostDraftFromHtml(responseUrl, html);
+    sendResponse({
+      ok: true,
+      url,
+      responseUrl,
+      contentType,
+      bytes: html.length,
+      tagCount: draft.seedTags?.length ?? 0,
+      mediaUrl: draft.mediaUrl,
+      previewUrl: draft.previewUrl,
+      draft
+    });
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      url,
+      error: error instanceof Error ? error.message : "Booru post fetch failed."
+    });
+  }
+}
+
+function sameOriginUrl(value: string): boolean {
+  try {
+    return new URL(value).origin === location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function extractBooruPostDraftFromHtml(pageUrl: string, html: string): ImportDraft {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const postUrl = booruDocumentPostUrl(doc, pageUrl) || pageUrl;
+  const externalSourceUrl = booruDocumentExternalSourceUrl(doc, postUrl);
+  const mediaUrl = booruDocumentOriginalMediaUrl(doc, postUrl);
+  const previewUrl = booruDocumentPreviewUrl(doc, postUrl) || mediaUrl;
+  const tagData = booruDocumentTagData(doc);
+  const rating = booruDocumentRating(doc);
+
+  return {
+    site: "booru",
+    pageUrl: postUrl,
+    sourceUrl: externalSourceUrl || postUrl,
+    mediaUrl,
+    previewUrl,
+    artistTag: tagData.artistTag,
+    artistTags: tagData.artistTags,
+    seedTags: tagData.tags,
+    rating,
+    raw: {
+      pageBooruPostFetch: {
+        pageUrl,
+        postUrl,
+        sourceUrl: externalSourceUrl || postUrl,
+        externalSourceUrl,
+        artistTag: tagData.artistTag,
+        artistTags: tagData.artistTags,
+        mediaUrl,
+        previewUrl,
+        tagCount: tagData.tags.length
+      }
+    }
+  };
+}
+
+function booruDocumentPostUrl(doc: Document, pageUrl: string): string | undefined {
+  const candidates = [
+    absoluteUrlWithBase(doc.querySelector<HTMLLinkElement>("link[rel='canonical']")?.href, pageUrl),
+    absoluteUrlWithBase(doc.querySelector<HTMLMetaElement>("meta[property='og:url']")?.content, pageUrl),
+    pageUrl
+  ];
+
+  return candidates.find((candidate): candidate is string => Boolean(candidate && looksLikeBooruPostUrl(candidate)));
+}
+
+function booruDocumentExternalSourceUrl(doc: Document, pageUrl: string): string | undefined {
+  const sourceContainers = Array.from(doc.querySelectorAll<HTMLElement>(
+    "#post-info-source, .post-info-source, [data-source], [data-source-url], li[id*='source'], section[id*='source']"
+  ));
+
+  for (const container of sourceContainers) {
+    const dataSource = container.getAttribute("data-source-url") || container.getAttribute("data-source");
+    const dataUrl = usableExternalSourceUrl(dataSource, pageUrl);
+    if (dataUrl) return dataUrl;
+
+    for (const anchor of Array.from(container.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+      const url = usableExternalSourceUrl(anchor.href || anchor.getAttribute("href"), pageUrl);
+      if (url) return url;
+    }
+
+    const textUrl = firstUrlInText(container.textContent);
+    const url = usableExternalSourceUrl(textUrl, pageUrl);
+    if (url) return url;
+  }
+
+  return undefined;
+}
+
+function usableExternalSourceUrl(value: string | undefined | null, pageUrl: string): string | undefined {
+  const url = absoluteUrlWithBase(value, pageUrl);
+  if (!url || looksLikeBooruPostUrl(url)) return undefined;
+
+  try {
+    return new URL(url).origin === new URL(pageUrl).origin ? undefined : url;
+  } catch {
+    return undefined;
+  }
+}
+
+function firstUrlInText(value: string | undefined | null): string | undefined {
+  return value?.match(/https?:\/\/[^\s<>"')]+/i)?.[0];
+}
+
+function looksLikeBooruPostUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /\/posts?\/\d+\/?$|\/post\/show\/\d+\/?$|(?:^|[?&])id=\d+(?:&|$)/i.test(`${url.pathname}${url.search}`);
+  } catch {
+    return false;
+  }
+}
+
+function booruDocumentOriginalMediaUrl(doc: Document, pageUrl: string): string | undefined {
+  const selectors = [
+    "a#image-download-link[href]",
+    "a#highres[href]",
+    "a.original-file[href]",
+    "a[href*='/original/'][href]",
+    "a[href*='/data/original/'][href]",
+    "video source[src]",
+    "video[src]",
+    "img#image[src]",
+    "#image-container img[src]",
+    ".image-container img[src]"
+  ];
+
+  for (const selector of selectors) {
+    const element = doc.querySelector<HTMLElement>(selector);
+    const value = mediaLikeUrlFromFetchedElement(element);
+    const url = absoluteUrlWithBase(value, pageUrl);
+    if (url) return url;
+  }
+
+  return undefined;
+}
+
+function booruDocumentPreviewUrl(doc: Document, pageUrl: string): string | undefined {
+  const selectors = [
+    "meta[property='og:image']",
+    "meta[property='og:image:url']",
+    "meta[name='twitter:image']",
+    "meta[name='twitter:image:src']",
+    "img#image[src]",
+    "#image-container img[src]",
+    ".image-container img[src]"
+  ];
+
+  for (const selector of selectors) {
+    const element = doc.querySelector<HTMLElement>(selector);
+    const value = element instanceof HTMLMetaElement ? element.content : mediaLikeUrlFromFetchedElement(element);
+    const url = absoluteUrlWithBase(value, pageUrl);
+    if (url) return url;
+  }
+
+  return undefined;
+}
+
+function mediaLikeUrlFromFetchedElement(element: Element | undefined | null): string | undefined {
+  if (!element) return undefined;
+  if (element instanceof HTMLAnchorElement) return element.getAttribute("href") || element.href;
+  if (element instanceof HTMLSourceElement) return element.getAttribute("src") || element.src || firstSrcsetUrl(element.getAttribute("srcset"));
+  if (element instanceof HTMLVideoElement) return element.getAttribute("src") || element.src;
+  if (element instanceof HTMLImageElement) {
+    return element.getAttribute("data-original") ||
+      element.getAttribute("data-file-url") ||
+      element.getAttribute("data-src") ||
+      element.getAttribute("src") ||
+      element.src ||
+      firstSrcsetUrl(element.getAttribute("srcset"));
+  }
+  return element.getAttribute("href") || element.getAttribute("src") || element.getAttribute("data-src") || undefined;
+}
+
+function firstSrcsetUrl(value: string | undefined | null): string | undefined {
+  return value?.split(",")[0]?.trim().split(/\s+/)[0];
+}
+
+function booruDocumentTagData(doc: Document): { tags: string[]; artistTag?: string; artistTags: string[] } {
+  const selectors = [
+    ".tag-type-general a.search-tag",
+    ".tag-type-artist a.search-tag",
+    ".tag-type-character a.search-tag",
+    ".tag-type-copyright a.search-tag",
+    ".tag-type-meta a.search-tag",
+    ".tag-type-1 a.search-tag",
+    ".category-1 a.search-tag",
+    "[data-category] a.search-tag",
+    "[data-tag-category] a.search-tag",
+    "#tag-list a.search-tag",
+    "#tag-list a",
+    ".tag-list a.search-tag",
+    ".tag-list a",
+    "li[class*='tag-type'] a.search-tag",
+    "li[class*='tag-type'] a",
+    "li[class*='category-'] a.search-tag",
+    "li[class*='category-'] a",
+    "a[class*='tag-type']",
+    "a[class*='category-']",
+    ".tag a"
+  ];
+  const tags: string[] = [];
+  const artistTags: string[] = [];
+
+  for (const selector of selectors) {
+    for (const element of Array.from(doc.querySelectorAll(selector))) {
+      const tag = normalizeAdapterTag(element.textContent);
+      if (!tag) continue;
+      tags.push(tag);
+      if (booruTagElementCategory(element) === "artist") artistTags.push(tag);
+    }
+  }
+
+  const dedupedArtistTags = Array.from(new Set(artistTags));
+  return {
+    tags: Array.from(new Set(tags)),
+    artistTag: dedupedArtistTags[0],
+    artistTags: dedupedArtistTags
+  };
+}
+
+function booruTagElementCategory(element: Element): string | undefined {
+  const candidates = [
+    element,
+    element.closest("[class*='tag-type'], [class*='category-'], [data-category], [data-tag-category], [data-tag-type], [data-type]")
+  ].filter((candidate): candidate is Element => Boolean(candidate));
+
+  for (const candidate of candidates) {
+    for (const attribute of ["data-category", "data-tag-category", "data-tag-type", "data-type"]) {
+      const category = knownBooruCategory(candidate.getAttribute(attribute));
+      if (category) return category;
+    }
+
+    for (const className of Array.from(candidate.classList)) {
+      const category = knownBooruCategory(className);
+      if (category) return category;
+    }
+  }
+
+  return undefined;
+}
+
+function knownBooruCategory(value: string | undefined | null): string | undefined {
+  const normalized = normalizeBooruCategoryValue(value);
+  return ["general", "artist", "character", "copyright", "meta"].includes(normalized) ? normalized : undefined;
+}
+
+function normalizeBooruCategoryValue(value: string | undefined | null): string {
+  if (!value) return "unknown";
+  const normalized = value.trim().toLowerCase().replace(/-/g, "_").replace(/\s+/g, "_");
+  const stripped = normalized
+    .replace(/^tag_type_/, "")
+    .replace(/^tag_category_/, "")
+    .replace(/^type_/, "")
+    .replace(/^category_/, "");
+
+  if (stripped === "0" || stripped === "general") return "general";
+  if (stripped === "1" || stripped === "artist" || stripped === "artists") return "artist";
+  if (stripped === "3" || stripped === "copy" || stripped === "copyright" || stripped === "copyrights") return "copyright";
+  if (stripped === "4" || stripped === "character" || stripped === "characters") return "character";
+  if (stripped === "5" || stripped === "meta" || stripped === "metadata") return "meta";
+  return "unknown";
+}
+
+function booruDocumentRating(doc: Document): ImportDraft["rating"] {
+  const ratingElement = doc.querySelector("[data-rating], .rating, #rating, li[class*='rating']");
+  const dataRating = ratingElement?.getAttribute("data-rating")?.toLowerCase();
+  if (dataRating === "s" || dataRating === "safe") return "safe";
+  if (dataRating === "q" || dataRating === "questionable") return "questionable";
+  if (dataRating === "e" || dataRating === "explicit") return "explicit";
+  const text = (ratingElement?.textContent || doc.body.textContent || "").toLowerCase();
+  if (/\bexplicit\b|\brating:e\b|\brating_e\b/.test(text)) return "explicit";
+  if (/\bquestionable\b|\brating:q\b|\brating_q\b/.test(text)) return "questionable";
+  if (/\bsafe\b|\brating:s\b|\brating_s\b/.test(text)) return "safe";
+  return undefined;
+}
+
+function absoluteUrlWithBase(value: string | undefined | null, base: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value, base).href;
+  } catch {
+    return undefined;
+  }
+}
 
 async function handleExtractPageContext(message: { draft?: ImportDraft }, sendResponse: (response?: unknown) => void): Promise<void> {
   try {
